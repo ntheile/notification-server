@@ -7,7 +7,7 @@ use crate::models::nwc_pubkey::{NwcFilterInfo, NwcPubkeys};
 use crate::models::MIGRATIONS;
 use crate::routes::{broadcast, health_check, register, register_nwc, valid_origin, validate_cors};
 use axum::headers::Origin;
-use axum::http::{request::Parts, HeaderValue, StatusCode, Uri};
+use axum::http::{header, request::Parts, HeaderValue, StatusCode, Uri};
 use axum::routing::{get, post};
 use axum::{Extension, Router, TypedHeader};
 use diesel::r2d2::{ConnectionManager, Pool};
@@ -16,7 +16,7 @@ use diesel_migrations::MigrationHarness;
 use secp256k1::{All, PublicKey, Secp256k1};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
-use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+use tower_http::cors::{AllowMethods, AllowOrigin, CorsLayer};
 use web_push::{IsahcWebPushClient, PartialVapidSignatureBuilder, VapidSignatureBuilder};
 
 const ALLOWED_ORIGINS: [&str; 6] = [
@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(cors_function))
-                .allow_headers(AllowHeaders::any())
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
                 .allow_methods(AllowMethods::any()),
         )
         .layer(Extension(state));
