@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     let server_router = Router::new()
         .route("/health-check", get(health_check))
         .route("/register", post(register))
-        .route("/register-nwd", post(register_nwc))
+        .route("/register-nwc", post(register_nwc))
         .route("/broadcast", post(broadcast))
         .fallback(fallback)
         .layer(
