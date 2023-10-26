@@ -54,6 +54,7 @@ pub struct RegisterNwcRequest {
     pub author: XOnlyPublicKey,
     pub tagged: XOnlyPublicKey,
     pub relay: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +112,7 @@ async fn register_nwc_impl(state: &State, payload: RegisterNwcRequest) -> anyhow
         &author,
         &tagged,
         &payload.relay,
+        &payload.name,
     )?;
 
     // notify new nwc keys

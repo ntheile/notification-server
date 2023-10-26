@@ -114,7 +114,7 @@ async fn handle_event(
     let mut conn = db_pool.get()?;
 
     // find the subscription info
-    let Some(sub_info) = SubscriptionInfo::find_by_nwc(&mut conn, &event)? else {
+    let Some((sub_info, name)) = SubscriptionInfo::find_by_nwc_event(&mut conn, &event)? else {
         info!("No subscription found for event: {event:?}");
         return Ok(());
     };
@@ -125,10 +125,9 @@ async fn handle_event(
 
     // Now add payload and encrypt.
     let mut builder = WebPushMessageBuilder::new(&subscription_info);
-    // todo probably change this
     let content = json!({
-        "title": "WalletConnect Request",
-        "body": "You have a new request",
+        "title": format!("{name} has a pending payment!"),
+        "body": "You have a pending payment. Open Mutiny to complete the transaction",
         "event": event,
     })
     .to_string();

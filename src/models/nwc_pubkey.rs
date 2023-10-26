@@ -12,6 +12,7 @@ pub struct NwcPubkeys {
     pub author: String,
     pub tagged: String,
     pub relay: String,
+    pub name: String,
 
     pub created_at: chrono::NaiveDateTime,
 }
@@ -23,6 +24,7 @@ pub struct NewNwcPubkeys<'a> {
     pub author: &'a str,
     pub tagged: &'a str,
     pub relay: &'a str,
+    pub name: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -39,12 +41,14 @@ impl NwcPubkeys {
         author: &str,
         tagged: &str,
         relay: &str,
+        name: &str,
     ) -> anyhow::Result<()> {
         let new = NewNwcPubkeys {
             id,
             author,
             tagged,
             relay,
+            name,
         };
 
         diesel::insert_into(nwc_pubkeys::table)

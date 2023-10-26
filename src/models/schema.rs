@@ -6,6 +6,7 @@ diesel::table! {
         author -> Text,
         tagged -> Text,
         relay -> Text,
+        name -> Text,
         created_at -> Timestamp,
     }
 }

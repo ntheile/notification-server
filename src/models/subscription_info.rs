@@ -1,6 +1,7 @@
 use crate::models::schema::subscription_info::dsl;
 use crate::models::schema::{nwc_pubkeys, subscription_info};
 use diesel::prelude::*;
+use nostr::key::XOnlyPublicKey;
 use nostr::{Event, Tag};
 use serde::{Deserialize, Serialize};
 use web_push::{SubscriptionInfo as WebPushSubscriptionInfo, SubscriptionKeys};
@@ -67,7 +68,10 @@ impl SubscriptionInfo {
         Ok(items)
     }
 
-    pub fn find_by_nwc(conn: &mut PgConnection, event: &Event) -> anyhow::Result<Option<Self>> {
+    pub fn find_by_nwc_event(
+        conn: &mut PgConnection,
+        event: &Event,
+    ) -> anyhow::Result<Option<(Self, String)>> {
         let p_tag = event.tags.iter().find_map(|tag| {
             if let Tag::PubKey(p, _) = tag {
                 Some(p.to_owned())
@@ -82,12 +86,20 @@ impl SubscriptionInfo {
             None => return Ok(None),
         };
 
+        Self::find_by_nwc(conn, event.pubkey, p_tag)
+    }
+
+    pub fn find_by_nwc(
+        conn: &mut PgConnection,
+        author: XOnlyPublicKey,
+        tagged: XOnlyPublicKey,
+    ) -> anyhow::Result<Option<(Self, String)>> {
         let result = subscription_info::table
             .inner_join(nwc_pubkeys::table)
-            .filter(nwc_pubkeys::author.eq(hex::encode(event.pubkey.serialize())))
-            .filter(nwc_pubkeys::tagged.eq(hex::encode(p_tag.serialize())))
-            .select(dsl::subscription_info::all_columns())
-            .first::<Self>(conn)
+            .filter(nwc_pubkeys::author.eq(hex::encode(author.serialize())))
+            .filter(nwc_pubkeys::tagged.eq(hex::encode(tagged.serialize())))
+            .select((dsl::subscription_info::all_columns(), nwc_pubkeys::name))
+            .first::<(Self, String)>(conn)
             .optional()?;
 
         Ok(result)
