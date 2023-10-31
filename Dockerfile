@@ -33,4 +33,4 @@ ENV NOTIFICATION_PORT=8080
 EXPOSE $NOTIFICATION_PORT
 
 # Run the app
-CMD ./mutiny-notifications
+CMD ["./mutiny-notifications"]
