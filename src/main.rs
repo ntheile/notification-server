@@ -1,11 +1,17 @@
+mod apns;
 mod auth;
 mod listener;
 mod models;
 mod routes;
 
+use crate::apns::ApnsPushClient;
+use crate::models::apns_nwc_registration::ApnsNwcRegistration;
 use crate::models::nwc_pubkey::{NwcFilterInfo, NwcPubkeys};
 use crate::models::MIGRATIONS;
-use crate::routes::{broadcast, health_check, register, register_nwc, valid_origin, validate_cors};
+use crate::routes::{
+    broadcast, health_check, register, register_apns_nwc, register_nwc, valid_origin,
+    validate_cors, wake_nwc,
+};
 use axum::headers::Origin;
 use axum::http::{header, request::Parts, HeaderValue, StatusCode, Uri};
 use axum::routing::{get, post};
@@ -38,6 +44,7 @@ pub struct State {
     pub auth_key: Option<PublicKey>,
     pub self_hosted: bool,
     pub client: IsahcWebPushClient,
+    pub apns_client: Option<ApnsPushClient>,
     pub channel: Arc<Mutex<watch::Sender<NwcFilterInfo>>>,
     pub secp: Secp256k1<All>,
 }
@@ -86,13 +93,15 @@ async fn main() -> anyhow::Result<()> {
         .run_pending_migrations(MIGRATIONS)
         .expect("migrations could not run");
 
-    let filter_info = NwcPubkeys::get_filter_info(&mut connection)?;
+    let mut filter_info = NwcPubkeys::get_filter_info(&mut connection)?;
+    filter_info.merge(ApnsNwcRegistration::get_filter_info(&mut connection)?);
     let (sender, receiver) = watch::channel(filter_info);
     let channel = Arc::new(Mutex::new(sender));
 
     drop(connection);
 
     let client = IsahcWebPushClient::new()?;
+    let apns_client = ApnsPushClient::from_env()?;
     let secp = Secp256k1::gen_new();
 
     let state = State {
@@ -101,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         auth_key,
         self_hosted,
         client: client.clone(),
+        apns_client: apns_client.clone(),
         channel,
         secp,
     };
@@ -127,6 +137,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/health-check", get(health_check))
         .route("/register", post(register))
         .route("/register-nwc", post(register_nwc))
+        .route("/register-apns-nwc", post(register_apns_nwc))
+        .route("/.well-known/nostr/nwc-wake", post(wake_nwc))
         .route("/broadcast", post(broadcast))
         .fallback(fallback)
         .layer(
@@ -149,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
                 receiver.clone(),
                 sig_builder.clone(),
                 client.clone(),
+                apns_client.clone(),
             )
             .await
             {

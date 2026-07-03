@@ -1,4 +1,5 @@
 use crate::auth::verify_token;
+use crate::models::apns_nwc_registration::ApnsNwcRegistration;
 use crate::models::nwc_pubkey::NwcPubkeys;
 use crate::models::subscription_info::SubscriptionInfo;
 use crate::{State, ALLOWED_LOCALHOST, ALLOWED_ORIGINS, ALLOWED_SUBDOMAIN};
@@ -58,6 +59,42 @@ pub struct RegisterNwcRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterApnsNwcRequest {
+    pub id: Option<String>,
+    pub device_token: String,
+    pub bundle_id: Option<String>,
+    pub environment: Option<String>,
+    pub author: XOnlyPublicKey,
+    pub tagged: XOnlyPublicKey,
+    pub relay: String,
+    pub name: String,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NwcWakeRequest {
+    pub protocol: String,
+    pub version: String,
+    pub relay: String,
+    pub event_id: String,
+    pub wallet_service_pubkey: XOnlyPublicKey,
+    pub client_pubkey: XOnlyPublicKey,
+    pub event_created_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum NwcWakeResponse {
+    Accepted,
+    Rejected {
+        code: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
     pub title: String,
     pub body: String,
@@ -77,6 +114,65 @@ async fn register_impl(state: &State, payload: RegisterRequest) -> anyhow::Resul
     info!("Registered subscription with id: {id}!");
 
     Ok(id)
+}
+
+async fn register_apns_nwc_impl(
+    state: &State,
+    payload: RegisterApnsNwcRequest,
+) -> anyhow::Result<()> {
+    let mut conn = state.db_pool.get()?;
+    let id = payload.id.as_deref().expect("must have");
+    let author = hex::encode(payload.author.serialize());
+    let tagged = hex::encode(payload.tagged.serialize());
+    let bundle_id = payload
+        .bundle_id
+        .as_deref()
+        .unwrap_or("com.nicktee.rebelwallet");
+    let environment = payload.environment.as_deref().unwrap_or("sandbox");
+    let enabled = payload.enabled.unwrap_or(true);
+
+    ApnsNwcRegistration::register(
+        &mut conn,
+        id,
+        &payload.device_token,
+        bundle_id,
+        environment,
+        &author,
+        &tagged,
+        &payload.relay,
+        &payload.name,
+        enabled,
+    )?;
+
+    let filter_info = state.channel.lock().await;
+    filter_info.send_if_modified(|current| {
+        let author_changed = if current.authors.contains(&author) {
+            false
+        } else {
+            current.authors.push(author);
+            true
+        };
+
+        let tagged_changed = if current.tagged.contains(&payload.tagged) {
+            false
+        } else {
+            current.tagged.push(payload.tagged);
+            true
+        };
+
+        let relay_changed = if current.relays.contains(&payload.relay) {
+            false
+        } else {
+            current.relays.push(payload.relay);
+            true
+        };
+
+        author_changed || tagged_changed || relay_changed
+    });
+
+    info!("Registered APNS NWC wake connection!");
+
+    Ok(())
 }
 
 pub async fn register(
@@ -99,6 +195,29 @@ pub async fn register(
     match register_impl(&state, payload).await {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err(handle_anyhow_error("register", e)),
+    }
+}
+
+pub async fn register_apns_nwc(
+    origin: Option<TypedHeader<Origin>>,
+    auth: Option<TypedHeader<Authorization<Bearer>>>,
+    Extension(state): Extension<State>,
+    Json(mut payload): Json<RegisterApnsNwcRequest>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    if !state.self_hosted {
+        validate_cors(origin)?;
+    }
+
+    let auth_id = auth
+        .map(|TypedHeader(token)| verify_token(token.token(), &state))
+        .transpose()?
+        .flatten();
+
+    ensure_id!(payload, auth_id);
+
+    match register_apns_nwc_impl(&state, payload).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err(handle_anyhow_error("register_apns_nwc", e)),
     }
 }
 
@@ -167,6 +286,77 @@ pub async fn register_nwc(
     match register_nwc_impl(&state, payload).await {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err(handle_anyhow_error("register_nwc", e)),
+    }
+}
+
+async fn wake_nwc_impl(state: &State, payload: NwcWakeRequest) -> anyhow::Result<NwcWakeResponse> {
+    if payload.protocol != "nwc_wake" {
+        return Ok(NwcWakeResponse::Rejected {
+            code: "not_allowed".to_string(),
+            message: "invalid protocol".to_string(),
+            retry_after: None,
+        });
+    }
+    if payload.version != "v1" {
+        return Ok(NwcWakeResponse::Rejected {
+            code: "not_allowed".to_string(),
+            message: "unsupported version".to_string(),
+            retry_after: None,
+        });
+    }
+
+    let Some(apns_client) = state.apns_client.clone() else {
+        return Ok(NwcWakeResponse::Rejected {
+            code: "push_unavailable".to_string(),
+            message: "APNS is not configured".to_string(),
+            retry_after: None,
+        });
+    };
+
+    let mut conn = state.db_pool.get()?;
+    let registrations = ApnsNwcRegistration::find_by_nwc(
+        &mut conn,
+        payload.client_pubkey,
+        payload.wallet_service_pubkey,
+        &payload.relay,
+    )?;
+
+    if registrations.is_empty() {
+        return Ok(NwcWakeResponse::Rejected {
+            code: "unknown_connection".to_string(),
+            message: "no registered wake connection matched this request".to_string(),
+            retry_after: None,
+        });
+    }
+
+    let wallet_service_pubkey = hex::encode(payload.wallet_service_pubkey.serialize());
+    for registration in registrations {
+        apns_client
+            .send_wake(
+                &registration,
+                &payload.relay,
+                &payload.event_id,
+                Some(&wallet_service_pubkey),
+                None,
+            )
+            .await?;
+    }
+
+    Ok(NwcWakeResponse::Accepted)
+}
+
+pub async fn wake_nwc(
+    origin: Option<TypedHeader<Origin>>,
+    Extension(state): Extension<State>,
+    Json(payload): Json<NwcWakeRequest>,
+) -> Result<Json<NwcWakeResponse>, (StatusCode, String)> {
+    if !state.self_hosted {
+        validate_cors(origin)?;
+    }
+
+    match wake_nwc_impl(&state, payload).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => Err(handle_anyhow_error("wake_nwc", e)),
     }
 }
 

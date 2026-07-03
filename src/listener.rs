@@ -1,3 +1,5 @@
+use crate::apns::ApnsPushClient;
+use crate::models::apns_nwc_registration::ApnsNwcRegistration;
 use crate::models::nwc_pubkey::NwcFilterInfo;
 use crate::models::subscription_info::SubscriptionInfo;
 use diesel::r2d2::{ConnectionManager, Pool};
@@ -20,6 +22,7 @@ pub async fn start_listener(
     mut receiver: Receiver<NwcFilterInfo>,
     sig_builder: PartialVapidSignatureBuilder,
     web_push_client: IsahcWebPushClient,
+    apns_client: Option<ApnsPushClient>,
 ) -> anyhow::Result<()> {
     let keys = Keys::generate();
     loop {
@@ -61,19 +64,22 @@ pub async fn start_listener(
             tokio::select! {
                 Ok(notification) = notifications.recv() => {
                     match notification {
-                        RelayPoolNotification::Event(_url, event) => {
+                        RelayPoolNotification::Event(url, event) => {
                             // check correct kind and has a p tag
                             if event.kind == Kind::WalletConnectRequest && event.tags.iter().any(|tag| matches!(tag, Tag::PubKey(_, _))) {
                                 tokio::spawn({
                                     let sig_builder = sig_builder.clone();
                                     let db_pool = db_pool.clone();
                                     let web_push_client = web_push_client.clone();
+                                    let apns_client = apns_client.clone();
                                     async move {
                                         let fut = handle_event(
+                                            url.to_string(),
                                             event,
                                             db_pool,
                                             sig_builder,
                                             web_push_client,
+                                            apns_client,
                                         );
 
                                         match tokio::time::timeout(Duration::from_secs(30), fut).await {
@@ -106,12 +112,33 @@ pub async fn start_listener(
 
 /// Handle a WalletConnectRequest event by sending a push notification.
 async fn handle_event(
+    relay: String,
     event: Event,
     db_pool: Pool<ConnectionManager<PgConnection>>,
     sig_builder: PartialVapidSignatureBuilder,
     web_push_client: IsahcWebPushClient,
+    apns_client: Option<ApnsPushClient>,
 ) -> anyhow::Result<()> {
     let mut conn = db_pool.get()?;
+
+    let apns_registrations = ApnsNwcRegistration::find_by_nwc_event(&mut conn, &event, &relay)?;
+    if let Some(apns_client) = apns_client {
+        for registration in apns_registrations {
+            info!(
+                "Sending APNS nwc_wake push for event {} to {}",
+                event.id.to_hex(),
+                registration.id
+            );
+            apns_client
+                .send_wake_for_event(&registration, &event, &relay)
+                .await?;
+        }
+    } else if !apns_registrations.is_empty() {
+        info!(
+            "APNS is not configured; skipping {} APNS nwc_wake registrations",
+            apns_registrations.len()
+        );
+    }
 
     // find the subscription info
     let Some((sub_info, name)) = SubscriptionInfo::find_by_nwc_event(&mut conn, &event)? else {
@@ -128,7 +155,17 @@ async fn handle_event(
     let content = json!({
         "title": format!("{name} has a pending payment!"),
         "body": "You have a pending payment. Open Mutiny to complete the transaction",
-        "event": event,
+        "protocol": "nwc_wake",
+        "version": "v1",
+        "relay": relay,
+        "event_id": event.id.to_hex(),
+        "wallet_service_pubkey": event.tags.iter().find_map(|tag| {
+            if let Tag::PubKey(pubkey, _) = tag {
+                Some(hex::encode(pubkey.serialize()))
+            } else {
+                None
+            }
+        }),
     })
     .to_string();
     builder.set_payload(ContentEncoding::Aes128Gcm, content.as_bytes());

@@ -18,9 +18,11 @@ futures = "0.3.28"
 log = "0.4.20"
 hex = "0.4.3"
 jwt-compact = { version = "0.8.0", features = ["es256k"] }
+jsonwebtoken = "9.3.0"
 nostr = { version = "0.24.0", default-features = false, features = ["nip47"] }
 nostr-sdk = "0.24.0"
 pretty_env_logger = "0.5.0"
+reqwest = { version = "0.11.27", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = { version = "0.10", default-features = false }
 secp256k1 = "0.28.0"
 serde = "1.0"
