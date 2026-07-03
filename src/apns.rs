@@ -1,6 +1,7 @@
 use crate::models::apns_nwc_registration::ApnsNwcRegistration;
 use anyhow::{Context, Result};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use log::warn;
 use nostr::{Event, Tag};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,8 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_EMBEDDED_APNS_PAYLOAD_BYTES: usize = 3500;
 
 #[derive(Clone)]
 pub struct ApnsPushClient {
@@ -98,8 +101,8 @@ impl ApnsPushClient {
         let mut payload = json!({
             "aps": {
                 "alert": {
-                    "title": "Payment request pending",
-                    "body": "Open Rebel Wallet to continue."
+                    "title": "Wallet is processing in the background",
+                    "body": "Processing request..."
                 },
                 "mutable-content": 1,
                 "content-available": 1
@@ -112,6 +115,18 @@ impl ApnsPushClient {
         });
         if let Some(event_json) = event_json {
             payload["nwc_event"] = json!(event_json);
+            let embedded_size = serde_json::to_vec(&payload)
+                .context("failed to measure APNS wake payload")?
+                .len();
+            if embedded_size > MAX_EMBEDDED_APNS_PAYLOAD_BYTES {
+                warn!(
+                    "APNS nwc_wake payload for event {} is {} bytes with embedded event; sending compact wake instead",
+                    event_id, embedded_size
+                );
+                if let Some(payload) = payload.as_object_mut() {
+                    payload.remove("nwc_event");
+                }
+            }
         }
 
         let mut headers = HeaderMap::new();
@@ -119,10 +134,12 @@ impl ApnsPushClient {
             AUTHORIZATION,
             HeaderValue::from_str(&format!("bearer {auth_token}"))?,
         );
-        headers.insert("apns-topic", HeaderValue::from_str(&registration.bundle_id)?);
+        headers.insert(
+            "apns-topic",
+            HeaderValue::from_str(&registration.bundle_id)?,
+        );
         headers.insert("apns-push-type", HeaderValue::from_static("alert"));
         headers.insert("apns-priority", HeaderValue::from_static("10"));
-
         let response = self
             .http
             .post(endpoint)

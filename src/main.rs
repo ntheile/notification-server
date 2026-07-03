@@ -95,6 +95,12 @@ async fn main() -> anyhow::Result<()> {
 
     let mut filter_info = NwcPubkeys::get_filter_info(&mut connection)?;
     filter_info.merge(ApnsNwcRegistration::get_filter_info(&mut connection)?);
+    println!(
+        "Initial NWC watcher filter: authors={} wallet_pubkeys={} relays={}",
+        filter_info.authors.len(),
+        filter_info.tagged.len(),
+        filter_info.relays.len()
+    );
     let (sender, receiver) = watch::channel(filter_info);
     let channel = Arc::new(Mutex::new(sender));
 

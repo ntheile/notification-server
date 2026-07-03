@@ -29,6 +29,10 @@ pub async fn start_listener(
         let client = Client::new(&keys);
 
         let filter: NwcFilterInfo = receiver.borrow().clone();
+        let watched_author_count = filter.authors.len();
+        let watched_wallet_count = filter.tagged.len();
+        let configured_relay_count = filter.relays.len();
+        let mut websocket_relay_count = 0usize;
 
         for relay in filter.relays.iter() {
             if relay.is_empty() {
@@ -46,6 +50,7 @@ pub async fn start_listener(
             };
 
             client.add_relay(relay.as_str(), proxy).await?;
+            websocket_relay_count += 1;
         }
         client.connect().await;
 
@@ -57,9 +62,13 @@ pub async fn start_listener(
 
         client.subscribe(vec![nwc_requests]).await;
 
-        println!("Listening for events...");
+        println!(
+            "Listening for NWC events: kind=23194 authors={} wallet_pubkeys={} configured_relays={} websocket_relays={}",
+            watched_author_count, watched_wallet_count, configured_relay_count, websocket_relay_count
+        );
 
         let mut notifications = client.notifications();
+        let mut matched_event_count = 0u64;
         loop {
             tokio::select! {
                 Ok(notification) = notifications.recv() => {
@@ -67,6 +76,13 @@ pub async fn start_listener(
                         RelayPoolNotification::Event(url, event) => {
                             // check correct kind and has a p tag
                             if event.kind == Kind::WalletConnectRequest && event.tags.iter().any(|tag| matches!(tag, Tag::PubKey(_, _))) {
+                                matched_event_count += 1;
+                                println!(
+                                    "NWC event matched: count={} relay={} event_id={}",
+                                    matched_event_count,
+                                    url,
+                                    event.id.to_hex()
+                                );
                                 tokio::spawn({
                                     let sig_builder = sig_builder.clone();
                                     let db_pool = db_pool.clone();
@@ -101,6 +117,10 @@ pub async fn start_listener(
                     }
                 }
                 _ = receiver.changed() => {
+                    println!(
+                        "NWC watcher filter changed; reconnecting websocket relays after {} matched event(s)",
+                        matched_event_count
+                    );
                     break;
                 }
             }

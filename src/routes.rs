@@ -144,33 +144,24 @@ async fn register_apns_nwc_impl(
         enabled,
     )?;
 
+    let mut updated_filter_info = NwcPubkeys::get_filter_info(&mut conn)?;
+    updated_filter_info.merge(ApnsNwcRegistration::get_filter_info(&mut conn)?);
+    drop(conn);
+
     let filter_info = state.channel.lock().await;
-    filter_info.send_if_modified(|current| {
-        let author_changed = if current.authors.contains(&author) {
+    let changed = filter_info.send_if_modified(|current| {
+        if *current == updated_filter_info {
             false
         } else {
-            current.authors.push(author);
+            *current = updated_filter_info;
             true
-        };
-
-        let tagged_changed = if current.tagged.contains(&payload.tagged) {
-            false
-        } else {
-            current.tagged.push(payload.tagged);
-            true
-        };
-
-        let relay_changed = if current.relays.contains(&payload.relay) {
-            false
-        } else {
-            current.relays.push(payload.relay);
-            true
-        };
-
-        author_changed || tagged_changed || relay_changed
+        }
     });
 
-    info!("Registered APNS NWC wake connection!");
+    info!(
+        "Registered APNS NWC wake connection id={} author={} tagged={} relay={} enabled={} watcher_filter_changed={}",
+        id, author, tagged, payload.relay, enabled, changed
+    );
 
     Ok(())
 }
