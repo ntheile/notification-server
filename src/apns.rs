@@ -101,8 +101,8 @@ impl ApnsPushClient {
         let mut payload = json!({
             "aps": {
                 "alert": {
-                    "title": "Wallet is processing in the background",
-                    "body": "Processing request..."
+                    "title": "Nostr Connect",
+                    "body": "Received 1 Event"
                 },
                 "mutable-content": 1,
                 "content-available": 1
