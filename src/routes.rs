@@ -1,25 +1,32 @@
 use crate::auth::verify_token;
 use crate::models::nwc_pubkey::NwcPubkeys;
-use crate::models::nwc_push_registration::{
-    NwcPushRegistration, PUSH_SERVICE_APNS, PUSH_SERVICE_FCM,
-};
+use crate::models::nwc_push_registration::{NwcPushRegistration, PUSH_SERVICE_APNS};
 use crate::models::nwc_wake_event::NwcWakeEvent;
 use crate::models::subscription_info::SubscriptionInfo;
 use crate::{State, ALLOWED_LOCALHOST, ALLOWED_ORIGINS, ALLOWED_SUBDOMAIN};
+use axum::body::Bytes;
 use axum::headers::authorization::Bearer;
 use axum::headers::{Authorization, Origin};
-use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, HOST};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::{Extension, Json, TypedHeader};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use log::{error, info, warn};
 use nostr::key::XOnlyPublicKey;
-use serde::{Deserialize, Serialize};
+use nostr::{Event, Kind};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use web_push::{ContentEncoding, WebPushClient, WebPushMessageBuilder};
 use web_push::{SubscriptionInfo as WebPushSubscriptionInfo, Urgency};
 
 const NWC_WAKE_MAX_EVENT_AGE_SECS: u64 = 10 * 60;
 const NWC_WAKE_MAX_CLOCK_SKEW_SECS: u64 = 60;
+const NWC_WAKE_EVENT_RETENTION_SECS: u64 =
+    NWC_WAKE_MAX_EVENT_AGE_SECS + NWC_WAKE_MAX_CLOCK_SKEW_SECS;
+const NOSTR_HTTP_AUTH_MAX_AGE_SECS: u64 = 5 * 60;
+const NOSTR_HTTP_AUTH_MAX_CLOCK_SKEW_SECS: u64 = 60;
 
 macro_rules! ensure_id {
     ($payload:ident, $auth_id:expr) => {
@@ -205,25 +212,193 @@ pub async fn register(
 
 pub async fn register_nwc_push(
     origin: Option<TypedHeader<Origin>>,
-    auth: Option<TypedHeader<Authorization<Bearer>>>,
     Extension(state): Extension<State>,
-    Json(mut payload): Json<RegisterNwcPushRequest>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<()>, (StatusCode, String)> {
     if !state.self_hosted {
         validate_cors(origin)?;
     }
 
-    let auth_id = auth
-        .map(|TypedHeader(token)| verify_token(token.token(), &state))
-        .transpose()?
-        .flatten();
-
-    ensure_id!(payload, auth_id);
+    let payload: RegisterNwcPushRequest = parse_json_body(&body)?;
+    verify_nostr_http_auth(
+        &headers,
+        &method,
+        &uri,
+        &body,
+        payload.wallet_service_pubkey,
+    )?;
+    if payload.id.as_deref().unwrap_or("").trim().is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized: id required".to_string(),
+        ));
+    }
 
     match register_nwc_push_impl(&state, payload).await {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err(handle_anyhow_error("register_nwc_push", e)),
     }
+}
+
+fn parse_json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, (StatusCode, String)> {
+    serde_json::from_slice(body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON request body: {e}"),
+        )
+    })
+}
+
+fn verify_nostr_http_auth(
+    headers: &HeaderMap,
+    method: &Method,
+    uri: &Uri,
+    body: &[u8],
+    wallet_service_pubkey: XOnlyPublicKey,
+) -> Result<(), (StatusCode, String)> {
+    let auth_header = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized: Nostr auth required".to_string(),
+            )
+        })?;
+    let encoded_event = auth_header.strip_prefix("Nostr ").ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized: expected Nostr auth scheme".to_string(),
+        )
+    })?;
+    let event_json = BASE64.decode(encoded_event).map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("Unauthorized: invalid Nostr auth encoding: {e}"),
+        )
+    })?;
+    let event_json = String::from_utf8(event_json).map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("Unauthorized: invalid Nostr auth event JSON: {e}"),
+        )
+    })?;
+    let event = Event::from_json(event_json).map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("Unauthorized: invalid Nostr auth event: {e}"),
+        )
+    })?;
+
+    if event.kind != Kind::Custom(27235) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized: Nostr auth event must be kind 27235".to_string(),
+        ));
+    }
+    event.verify().map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("Unauthorized: invalid Nostr auth signature: {e}"),
+        )
+    })?;
+    if event.pubkey != wallet_service_pubkey {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized: Nostr auth pubkey does not match wallet_service_pubkey".to_string(),
+        ));
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("Unauthorized: invalid server clock: {e}"),
+            )
+        })?
+        .as_secs();
+    let created_at = event.created_at.as_u64();
+    if created_at > now.saturating_add(NOSTR_HTTP_AUTH_MAX_CLOCK_SKEW_SECS)
+        || now.saturating_sub(created_at) > NOSTR_HTTP_AUTH_MAX_AGE_SECS
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized: stale Nostr auth event".to_string(),
+        ));
+    }
+
+    let expected_url = effective_request_url(headers, uri)?;
+    require_auth_tag(&event, "u", &expected_url)?;
+    require_auth_tag(&event, "method", method.as_str())?;
+
+    let payload_hash = hex::encode(Sha256::digest(body));
+    require_auth_tag(&event, "payload", &payload_hash)?;
+
+    Ok(())
+}
+
+fn require_auth_tag(event: &Event, name: &str, expected: &str) -> Result<(), (StatusCode, String)> {
+    let matches = event.tags.iter().any(|tag| {
+        let tag = tag.as_vec();
+        tag.first().map(String::as_str) == Some(name)
+            && tag.get(1).map(String::as_str) == Some(expected)
+    });
+    if matches {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            format!("Unauthorized: missing or invalid Nostr auth {name} tag"),
+        ))
+    }
+}
+
+fn effective_request_url(headers: &HeaderMap, uri: &Uri) -> Result<String, (StatusCode, String)> {
+    let host = forwarded_header(headers, "x-forwarded-host")
+        .or_else(|| header_value(headers, HOST.as_str()))
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized: host header required".to_string(),
+            )
+        })?;
+    let scheme = forwarded_header(headers, "x-forwarded-proto").unwrap_or_else(|| {
+        if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+            "http".to_string()
+        } else {
+            "https".to_string()
+        }
+    });
+    let path = uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/");
+
+    Ok(format!("{scheme}://{host}{path}"))
+}
+
+fn forwarded_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    header_value(headers, name).map(|value| {
+        value
+            .split(',')
+            .next()
+            .unwrap_or(value.as_str())
+            .trim()
+            .to_string()
+    })
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn register_nwc_impl(state: &State, payload: RegisterNwcRequest) -> anyhow::Result<()> {
@@ -345,9 +520,8 @@ async fn wake_nwc_impl(state: &State, payload: NwcWakeRequest) -> anyhow::Result
             });
         }
 
-        let recorded =
-            NwcWakeEvent::record_once(&mut conn, &payload.event_id, payload.event_created_at)?;
-        if !recorded {
+        NwcWakeEvent::prune_older_than(&mut conn, NWC_WAKE_EVENT_RETENTION_SECS)?;
+        if NwcWakeEvent::exists(&mut conn, &payload.event_id)? {
             return Ok(NwcWakeResponse::Rejected {
                 code: "replay".to_string(),
                 message: "wake event was already processed".to_string(),
@@ -406,6 +580,17 @@ async fn wake_nwc_impl(state: &State, payload: NwcWakeRequest) -> anyhow::Result
         });
     }
 
+    let recorded = {
+        let mut conn = state.db_pool.get()?;
+        NwcWakeEvent::record_once(&mut conn, &payload.event_id, payload.event_created_at)?
+    };
+    if !recorded {
+        warn!(
+            "NWC wake event {} was delivered but was already recorded",
+            payload.event_id
+        );
+    }
+
     Ok(NwcWakeResponse::Accepted)
 }
 
@@ -442,7 +627,7 @@ fn validate_wake_event_freshness(
 
 fn validate_push_service(push_service: &str) -> anyhow::Result<()> {
     match push_service {
-        PUSH_SERVICE_APNS | PUSH_SERVICE_FCM => Ok(()),
+        PUSH_SERVICE_APNS => Ok(()),
         _ => anyhow::bail!("invalid push_service"),
     }
 }

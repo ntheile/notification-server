@@ -17,13 +17,16 @@ Your public key will be need to be used when building mutiny-web.
 
 The server can also act as a privacy-preserving NWC wake provider for Rebel
 Wallet. It listens for registered `kind:23194` NWC request events and sends an
-APNs payload containing only:
+APNs payload containing:
 
 - `protocol`
 - `version`
 - `relay`
 - `event_id`
 - `wallet_service_pubkey`
+
+When the full event fits inside APNs limits, the payload may also include
+`nwc_event`; otherwise the phone can refetch by `event_id`.
 
 It does not need the NWC secret, wallet private key, decrypted request, invoice,
 amount, memo, or balance.
@@ -42,6 +45,7 @@ Register a wallet app install/NWC connection:
 ```http
 POST /register-nwc-push
 Content-Type: application/json
+Authorization: Nostr <base64-kind-27235-event>
 
 {
   "id": "install-id",
@@ -57,13 +61,15 @@ Content-Type: application/json
 }
 ```
 
+The `Authorization` event follows NIP-98-style HTTP auth. It must be signed by
+`wallet_service_pubkey`, be kind `27235`, and include `u`, `method`, and
+`payload` tags for the request URL, `POST`, and the SHA-256 hash of the JSON
+body.
+
 NWC push registrations are stored in the generic `nwc_push_registrations` table.
 iOS/APNS uses `push_service = "apns"` with the APNS device token in
-`push_token`. Android/FCM can use `push_service = "fcm"` with the FCM
-registration token in `push_token`. FCM registration storage is supported by the
-normalized API and model; FCM delivery is stubbed in `src/fcm.rs` and still needs
-service-account authentication and dispatcher wiring before Android wake pushes
-are live.
+`push_token`. Android/FCM is reserved in the schema, but the API currently
+rejects `push_service = "fcm"` until FCM delivery is wired up.
 
 The spec wake endpoint is also available at:
 

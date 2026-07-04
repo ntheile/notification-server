@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 pub const PUSH_SERVICE_APNS: &str = "apns";
-pub const PUSH_SERVICE_FCM: &str = "fcm";
 
 #[derive(Queryable, Insertable, AsChangeset, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -23,8 +22,8 @@ pub struct NwcPushRegistration {
     pub relay: String,
     pub name: String,
     pub enabled: bool,
-    pub created_at: chrono::NaiveDateTime,
-    pub updated_at: chrono::NaiveDateTime,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Insertable, AsChangeset)]

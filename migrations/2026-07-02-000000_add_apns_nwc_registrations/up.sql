@@ -10,8 +10,8 @@ CREATE TABLE nwc_push_registrations
     relay        TEXT      NOT NULL,
     name         TEXT      NOT NULL,
     enabled      BOOLEAN   NOT NULL DEFAULT TRUE,
-    created_at   TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT nwc_push_registrations_push_service_check CHECK (push_service IN ('apns', 'fcm')),
     CONSTRAINT nwc_push_registrations_environment_check CHECK (environment IN ('sandbox', 'production')),
     PRIMARY KEY (id, push_service, author, tagged, relay)
@@ -25,7 +25,7 @@ CREATE TABLE nwc_wake_events
 (
     event_id         TEXT      NOT NULL PRIMARY KEY,
     event_created_at BIGINT,
-    received_at      TIMESTAMP NOT NULL DEFAULT NOW()
+    received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX nwc_wake_events_received_at_idx

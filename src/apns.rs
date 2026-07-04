@@ -1,6 +1,7 @@
 use crate::models::nwc_push_registration::NwcPushRegistration;
 use anyhow::{Context, Result};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use log::warn;
 use nostr::{Event, Tag};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const APNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_APNS_PAYLOAD_BYTES: usize = 4096;
 
 #[derive(Clone)]
 pub struct ApnsPushClient {
@@ -149,23 +151,20 @@ impl ApnsPushClient {
             .auth_token()
             .map_err(|e| ApnsSendError::Build(format!("failed to create APNS auth token: {e}")))?;
 
-        let mut payload = json!({
-            "aps": {
-                "alert": {
-                    "title": "Nostr Connect",
-                    "body": "Received 1 Event"
-                },
-                "mutable-content": 1,
-                "content-available": 1
-            },
-            "protocol": "nwc_wake",
-            "version": "v1",
-            "relay": relay,
-            "event_id": event_id,
-            "wallet_service_pubkey": wallet_service_pubkey
-        });
-        if let Some(nwc_event) = nwc_event {
-            payload["nwc_event"] = json!(nwc_event);
+        let mut payload =
+            wake_payload(relay, event_id, wallet_service_pubkey, nwc_event.as_deref());
+        if nwc_event.is_some() && payload_size(&payload)? > MAX_APNS_PAYLOAD_BYTES {
+            warn!(
+                "Omitting embedded NWC event from APNS wake payload for event {} because it exceeds {} bytes",
+                event_id, MAX_APNS_PAYLOAD_BYTES
+            );
+            payload = wake_payload(relay, event_id, wallet_service_pubkey, None);
+        }
+        let size = payload_size(&payload)?;
+        if size > MAX_APNS_PAYLOAD_BYTES {
+            return Err(ApnsSendError::Build(format!(
+                "APNS wake payload is {size} bytes, exceeding {MAX_APNS_PAYLOAD_BYTES} bytes"
+            )));
         }
 
         let mut headers = HeaderMap::new();
@@ -239,6 +238,39 @@ fn optional_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+fn wake_payload(
+    relay: &str,
+    event_id: &str,
+    wallet_service_pubkey: &str,
+    nwc_event: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = json!({
+        "aps": {
+            "alert": {
+                "title": "Nostr Connect",
+                "body": "Received 1 Event"
+            },
+            "mutable-content": 1,
+            "content-available": 1
+        },
+        "protocol": "nwc_wake",
+        "version": "v1",
+        "relay": relay,
+        "event_id": event_id,
+        "wallet_service_pubkey": wallet_service_pubkey
+    });
+    if let Some(nwc_event) = nwc_event {
+        payload["nwc_event"] = json!(nwc_event);
+    }
+    payload
+}
+
+fn payload_size(payload: &serde_json::Value) -> std::result::Result<usize, ApnsSendError> {
+    serde_json::to_vec(payload)
+        .map(|bytes| bytes.len())
+        .map_err(|e| ApnsSendError::Build(format!("failed to serialize APNS wake payload: {e}")))
+}
+
 fn wallet_service_pubkey(event: &Event) -> Option<String> {
     event.tags.iter().find_map(|tag| {
         if let Tag::PubKey(pubkey, _) = tag {
@@ -254,6 +286,7 @@ fn is_permanent_apns_failure(status: reqwest::StatusCode) -> bool {
         status,
         reqwest::StatusCode::BAD_REQUEST
             | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::PAYLOAD_TOO_LARGE
             | reqwest::StatusCode::GONE
     )
 }

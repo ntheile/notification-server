@@ -12,8 +12,8 @@ diesel::table! {
         relay -> Text,
         name -> Text,
         enabled -> Bool,
-        created_at -> Timestamp,
-        updated_at -> Timestamp,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -21,7 +21,7 @@ diesel::table! {
     nwc_wake_events (event_id) {
         event_id -> Text,
         event_created_at -> Nullable<Int8>,
-        received_at -> Timestamp,
+        received_at -> Timestamptz,
     }
 }
 
