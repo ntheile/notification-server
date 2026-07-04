@@ -1,6 +1,7 @@
 use crate::apns::ApnsPushClient;
 use crate::models::nwc_pubkey::NwcFilterInfo;
 use crate::models::nwc_push_registration::NwcPushRegistration;
+use crate::models::nwc_wake_event::NwcWakeEvent;
 use crate::models::subscription_info::SubscriptionInfo;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::PgConnection;
@@ -155,7 +156,26 @@ async fn handle_event(
                 wallet_service_pubkey(&event).unwrap_or_else(|| "<missing>".to_string()),
                 relay
             );
+        } else {
+            let inserted = {
+                let mut conn = db_pool.get()?;
+                NwcWakeEvent::record_once(
+                    &mut conn,
+                    &event.id.to_hex(),
+                    Some(event.created_at.as_u64()),
+                )?
+            };
+
+            if !inserted {
+                info!(
+                    "Skipping duplicate APNS nwc_wake event from relay {}: event_id={}",
+                    relay,
+                    event.id.to_hex()
+                );
+                return Ok(());
+            }
         }
+
         for registration in &apns_registrations {
             println!(
                 "Sending APNS nwc_wake push for event {} to {}",
