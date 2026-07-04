@@ -37,24 +37,33 @@ APNS_PRIVATE_KEY_PATH=/absolute/path/AuthKey_XXXXXXXXXX.p8
 # or APNS_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----..."
 ```
 
-Register a Rebel install/NWC connection:
+Register a wallet app install/NWC connection:
 
 ```http
-POST /register-apns-nwc
+POST /register-nwc-push
 Content-Type: application/json
 
 {
   "id": "install-id",
-  "device_token": "apns-token",
-  "bundle_id": "com.nicktee.rebelwallet",
+  "push_service": "apns",
+  "push_token": "apns-token",
+  "app_id": "com.wallet.example",
   "environment": "sandbox",
-  "author": "nwc-client-pubkey",
-  "tagged": "wallet-service-pubkey",
+  "client_pubkey": "nwc-client-pubkey",
+  "wallet_service_pubkey": "wallet-service-pubkey",
   "relay": "wss://relay.getalby.com/v1",
   "name": "Alby Go",
   "enabled": true
 }
 ```
+
+NWC push registrations are stored in the generic `nwc_push_registrations` table.
+iOS/APNS uses `push_service = "apns"` with the APNS device token in
+`push_token`. Android/FCM can use `push_service = "fcm"` with the FCM
+registration token in `push_token`. FCM registration storage is supported by the
+normalized API and model; FCM delivery is stubbed in `src/fcm.rs` and still needs
+service-account authentication and dispatcher wiring before Android wake pushes
+are live.
 
 The spec wake endpoint is also available at:
 
@@ -62,5 +71,5 @@ The spec wake endpoint is also available at:
 POST /.well-known/nostr/nwc-wake
 ```
 
-Rebel Wallet will call `/register-apns-nwc` automatically when
+The wallet app will call `/register-nwc-push` automatically when
 `NWC_WAKE_SERVER_URL` is set in the iOS build environment.

@@ -1,16 +1,16 @@
-use crate::models::apns_nwc_registration::ApnsNwcRegistration;
+use crate::models::nwc_push_registration::NwcPushRegistration;
 use anyhow::{Context, Result};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use log::warn;
 use nostr::{Event, Tag};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAX_EMBEDDED_APNS_PAYLOAD_BYTES: usize = 3500;
+const APNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct ApnsPushClient {
@@ -33,6 +33,40 @@ struct CachedApnsToken {
     issued_at: u64,
 }
 
+#[derive(Debug)]
+pub enum ApnsSendError {
+    Build(String),
+    Request(reqwest::Error),
+    Permanent {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    Transient {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+}
+
+impl ApnsSendError {
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, Self::Permanent { .. })
+    }
+}
+
+impl fmt::Display for ApnsSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Build(message) => write!(f, "{message}"),
+            Self::Request(error) => write!(f, "failed to send APNS wake push: {error}"),
+            Self::Permanent { status, body } | Self::Transient { status, body } => {
+                write!(f, "APNS wake push failed with {status}: {body}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApnsSendError {}
+
 impl ApnsPushClient {
     pub fn from_env() -> Result<Option<Self>> {
         let Some(team_id) = optional_env("APNS_TEAM_ID") else {
@@ -50,6 +84,7 @@ impl ApnsPushClient {
         let encoding_key =
             EncodingKey::from_ec_pem(private_key.as_bytes()).context("invalid APNS .p8 key")?;
         let http = reqwest::Client::builder()
+            .timeout(APNS_REQUEST_TIMEOUT)
             .build()
             .context("failed to build APNS HTTP client")?;
 
@@ -64,31 +99,45 @@ impl ApnsPushClient {
 
     pub async fn send_wake_for_event(
         &self,
-        registration: &ApnsNwcRegistration,
+        registration: &NwcPushRegistration,
         event: &Event,
         relay: &str,
-    ) -> Result<()> {
-        self.send_wake(
+    ) -> std::result::Result<(), ApnsSendError> {
+        let event_json = serde_json::to_string(event)
+            .map_err(|e| ApnsSendError::Build(format!("failed to serialize NWC event: {e}")))?;
+
+        self.send_wake_inner(
             registration,
             relay,
             &event.id.to_hex(),
             wallet_service_pubkey(event).as_deref(),
-            Some(event.as_json()),
+            Some(event_json),
         )
         .await
     }
 
     pub async fn send_wake(
         &self,
-        registration: &ApnsNwcRegistration,
+        registration: &NwcPushRegistration,
         relay: &str,
         event_id: &str,
         wallet_service_pubkey: Option<&str>,
-        event_json: Option<String>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), ApnsSendError> {
+        self.send_wake_inner(registration, relay, event_id, wallet_service_pubkey, None)
+            .await
+    }
+
+    async fn send_wake_inner(
+        &self,
+        registration: &NwcPushRegistration,
+        relay: &str,
+        event_id: &str,
+        wallet_service_pubkey: Option<&str>,
+        nwc_event: Option<String>,
+    ) -> std::result::Result<(), ApnsSendError> {
         let wallet_service_pubkey = wallet_service_pubkey.unwrap_or(&registration.tagged);
         let token = registration
-            .device_token
+            .push_token
             .chars()
             .filter(|ch| !matches!(ch, '<' | '>' | ' '))
             .collect::<String>();
@@ -96,7 +145,9 @@ impl ApnsPushClient {
             "production" => format!("https://api.push.apple.com/3/device/{token}"),
             _ => format!("https://api.sandbox.push.apple.com/3/device/{token}"),
         };
-        let auth_token = self.auth_token()?;
+        let auth_token = self
+            .auth_token()
+            .map_err(|e| ApnsSendError::Build(format!("failed to create APNS auth token: {e}")))?;
 
         let mut payload = json!({
             "aps": {
@@ -113,30 +164,20 @@ impl ApnsPushClient {
             "event_id": event_id,
             "wallet_service_pubkey": wallet_service_pubkey
         });
-        if let Some(event_json) = event_json {
-            payload["nwc_event"] = json!(event_json);
-            let embedded_size = serde_json::to_vec(&payload)
-                .context("failed to measure APNS wake payload")?
-                .len();
-            if embedded_size > MAX_EMBEDDED_APNS_PAYLOAD_BYTES {
-                warn!(
-                    "APNS nwc_wake payload for event {} is {} bytes with embedded event; sending compact wake instead",
-                    event_id, embedded_size
-                );
-                if let Some(payload) = payload.as_object_mut() {
-                    payload.remove("nwc_event");
-                }
-            }
+        if let Some(nwc_event) = nwc_event {
+            payload["nwc_event"] = json!(nwc_event);
         }
 
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("bearer {auth_token}"))?,
+            HeaderValue::from_str(&format!("bearer {auth_token}"))
+                .map_err(|e| ApnsSendError::Build(format!("invalid APNS auth header: {e}")))?,
         );
         headers.insert(
             "apns-topic",
-            HeaderValue::from_str(&registration.bundle_id)?,
+            HeaderValue::from_str(&registration.app_id)
+                .map_err(|e| ApnsSendError::Build(format!("invalid APNS topic header: {e}")))?,
         );
         headers.insert("apns-push-type", HeaderValue::from_static("alert"));
         headers.insert("apns-priority", HeaderValue::from_static("10"));
@@ -147,11 +188,14 @@ impl ApnsPushClient {
             .json(&payload)
             .send()
             .await
-            .context("failed to send APNS wake push")?;
+            .map_err(ApnsSendError::Request)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("APNS wake push failed with {status}: {body}");
+            if is_permanent_apns_failure(status) {
+                return Err(ApnsSendError::Permanent { status, body });
+            }
+            return Err(ApnsSendError::Transient { status, body });
         }
 
         Ok(())
@@ -203,4 +247,13 @@ fn wallet_service_pubkey(event: &Event) -> Option<String> {
             None
         }
     })
+}
+
+fn is_permanent_apns_failure(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::GONE
+    )
 }

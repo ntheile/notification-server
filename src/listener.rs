@@ -1,10 +1,10 @@
 use crate::apns::ApnsPushClient;
-use crate::models::apns_nwc_registration::ApnsNwcRegistration;
 use crate::models::nwc_pubkey::NwcFilterInfo;
+use crate::models::nwc_push_registration::NwcPushRegistration;
 use crate::models::subscription_info::SubscriptionInfo;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::PgConnection;
-use log::info;
+use log::{info, warn};
 use nostr::{Event, Filter, Keys, Kind, Tag, Timestamp};
 use nostr_sdk::{Client, RelayPoolNotification};
 use serde_json::json;
@@ -29,7 +29,7 @@ pub async fn start_listener(
         let client = Client::new(&keys);
 
         let filter: NwcFilterInfo = receiver.borrow().clone();
-        let watched_author_count = filter.authors.len();
+        let registered_client_count = filter.authors.len();
         let watched_wallet_count = filter.tagged.len();
         let configured_relay_count = filter.relays.len();
         let mut websocket_relay_count = 0usize;
@@ -56,15 +56,14 @@ pub async fn start_listener(
 
         let nwc_requests = Filter::new()
             .kind(Kind::WalletConnectRequest)
-            .authors(filter.authors)
             .pubkeys(filter.tagged)
             .since(Timestamp::now());
 
         client.subscribe(vec![nwc_requests]).await;
 
         println!(
-            "Listening for NWC events: kind=23194 authors={} wallet_pubkeys={} configured_relays={} websocket_relays={}",
-            watched_author_count, watched_wallet_count, configured_relay_count, websocket_relay_count
+            "Listening for NWC events: kind=23194 registered_clients={} wallet_pubkeys={} configured_relays={} websocket_relays={}",
+            registered_client_count, watched_wallet_count, configured_relay_count, websocket_relay_count
         );
 
         let mut notifications = client.notifications();
@@ -139,19 +138,57 @@ async fn handle_event(
     web_push_client: IsahcWebPushClient,
     apns_client: Option<ApnsPushClient>,
 ) -> anyhow::Result<()> {
-    let mut conn = db_pool.get()?;
+    let (apns_registrations, subscription) = {
+        let mut conn = db_pool.get()?;
+        let apns_registrations =
+            NwcPushRegistration::find_apns_by_nwc_event(&mut conn, &event, &relay)?;
+        let subscription = SubscriptionInfo::find_by_nwc_event(&mut conn, &event)?;
+        (apns_registrations, subscription)
+    };
 
-    let apns_registrations = ApnsNwcRegistration::find_by_nwc_event(&mut conn, &event, &relay)?;
     if let Some(apns_client) = apns_client {
-        for registration in apns_registrations {
+        if apns_registrations.is_empty() {
+            println!(
+                "NWC event matched but no enabled APNS registration found: event_id={} client_pubkey={} wallet_service_pubkey={} relay={}",
+                event.id.to_hex(),
+                hex::encode(event.pubkey.serialize()),
+                wallet_service_pubkey(&event).unwrap_or_else(|| "<missing>".to_string()),
+                relay
+            );
+        }
+        for registration in &apns_registrations {
+            println!(
+                "Sending APNS nwc_wake push for event {} to {}",
+                event.id.to_hex(),
+                registration.id
+            );
             info!(
                 "Sending APNS nwc_wake push for event {} to {}",
                 event.id.to_hex(),
                 registration.id
             );
-            apns_client
-                .send_wake_for_event(&registration, &event, &relay)
-                .await?;
+            if let Err(err) = apns_client
+                .send_wake_for_event(registration, &event, &relay)
+                .await
+            {
+                warn!(
+                    "Failed to send APNS nwc_wake push for event {} to {}: {}",
+                    event.id.to_hex(),
+                    registration.id,
+                    err
+                );
+                if err.is_permanent() {
+                    let mut conn = db_pool.get()?;
+                    NwcPushRegistration::disable(&mut conn, registration)?;
+                    info!(
+                        "Disabled stale APNS NWC registration id={} author={} tagged={} relay={}",
+                        registration.id,
+                        registration.author,
+                        registration.tagged,
+                        registration.relay
+                    );
+                }
+            }
         }
     } else if !apns_registrations.is_empty() {
         info!(
@@ -161,7 +198,7 @@ async fn handle_event(
     }
 
     // find the subscription info
-    let Some((sub_info, name)) = SubscriptionInfo::find_by_nwc_event(&mut conn, &event)? else {
+    let Some((sub_info, name)) = subscription else {
         info!("No subscription found for event: {event:?}");
         return Ok(());
     };
@@ -196,4 +233,14 @@ async fn handle_event(
     web_push_client.send(builder.build()?).await?;
 
     Ok(())
+}
+
+fn wallet_service_pubkey(event: &Event) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        if let Tag::PubKey(pubkey, _) = tag {
+            Some(hex::encode(pubkey.serialize()))
+        } else {
+            None
+        }
+    })
 }

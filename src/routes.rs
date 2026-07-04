@@ -1,18 +1,25 @@
 use crate::auth::verify_token;
-use crate::models::apns_nwc_registration::ApnsNwcRegistration;
 use crate::models::nwc_pubkey::NwcPubkeys;
+use crate::models::nwc_push_registration::{
+    NwcPushRegistration, PUSH_SERVICE_APNS, PUSH_SERVICE_FCM,
+};
+use crate::models::nwc_wake_event::NwcWakeEvent;
 use crate::models::subscription_info::SubscriptionInfo;
 use crate::{State, ALLOWED_LOCALHOST, ALLOWED_ORIGINS, ALLOWED_SUBDOMAIN};
 use axum::headers::authorization::Bearer;
 use axum::headers::{Authorization, Origin};
 use axum::http::StatusCode;
 use axum::{Extension, Json, TypedHeader};
-use log::{error, info};
+use log::{error, info, warn};
 use nostr::key::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 use web_push::{ContentEncoding, WebPushClient, WebPushMessageBuilder};
 use web_push::{SubscriptionInfo as WebPushSubscriptionInfo, Urgency};
+
+const NWC_WAKE_MAX_EVENT_AGE_SECS: u64 = 10 * 60;
+const NWC_WAKE_MAX_CLOCK_SKEW_SECS: u64 = 60;
 
 macro_rules! ensure_id {
     ($payload:ident, $auth_id:expr) => {
@@ -59,19 +66,6 @@ pub struct RegisterNwcRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterApnsNwcRequest {
-    pub id: Option<String>,
-    pub device_token: String,
-    pub bundle_id: Option<String>,
-    pub environment: Option<String>,
-    pub author: XOnlyPublicKey,
-    pub tagged: XOnlyPublicKey,
-    pub relay: String,
-    pub name: String,
-    pub enabled: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NwcWakeRequest {
     pub protocol: String,
     pub version: String,
@@ -101,6 +95,20 @@ pub struct Notification {
     pub icon: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterNwcPushRequest {
+    pub id: Option<String>,
+    pub push_service: String,
+    pub push_token: String,
+    pub app_id: String,
+    pub environment: String,
+    pub client_pubkey: XOnlyPublicKey,
+    pub wallet_service_pubkey: XOnlyPublicKey,
+    pub relay: String,
+    pub name: String,
+    pub enabled: Option<bool>,
+}
+
 async fn register_impl(state: &State, payload: RegisterRequest) -> anyhow::Result<String> {
     let mut conn = state.db_pool.get()?;
     let id = SubscriptionInfo::register(
@@ -116,27 +124,33 @@ async fn register_impl(state: &State, payload: RegisterRequest) -> anyhow::Resul
     Ok(id)
 }
 
-async fn register_apns_nwc_impl(
+async fn register_nwc_push_impl(
     state: &State,
-    payload: RegisterApnsNwcRequest,
+    payload: RegisterNwcPushRequest,
 ) -> anyhow::Result<()> {
     let mut conn = state.db_pool.get()?;
     let id = payload.id.as_deref().expect("must have");
-    let author = hex::encode(payload.author.serialize());
-    let tagged = hex::encode(payload.tagged.serialize());
-    let bundle_id = payload
-        .bundle_id
-        .as_deref()
-        .unwrap_or("com.nicktee.rebelwallet");
-    let environment = payload.environment.as_deref().unwrap_or("sandbox");
+    let push_service = payload.push_service.trim().to_ascii_lowercase();
+    validate_push_service(&push_service)?;
+    validate_push_environment(&payload.environment)?;
+    if payload.push_token.trim().is_empty() {
+        anyhow::bail!("push_token is required");
+    }
+    if payload.app_id.trim().is_empty() {
+        anyhow::bail!("app_id is required");
+    }
+
+    let author = hex::encode(payload.client_pubkey.serialize());
+    let tagged = hex::encode(payload.wallet_service_pubkey.serialize());
     let enabled = payload.enabled.unwrap_or(true);
 
-    ApnsNwcRegistration::register(
+    NwcPushRegistration::register(
         &mut conn,
         id,
-        &payload.device_token,
-        bundle_id,
-        environment,
+        &push_service,
+        &payload.push_token,
+        &payload.app_id,
+        &payload.environment,
         &author,
         &tagged,
         &payload.relay,
@@ -145,7 +159,7 @@ async fn register_apns_nwc_impl(
     )?;
 
     let mut updated_filter_info = NwcPubkeys::get_filter_info(&mut conn)?;
-    updated_filter_info.merge(ApnsNwcRegistration::get_filter_info(&mut conn)?);
+    updated_filter_info.merge(NwcPushRegistration::get_filter_info(&mut conn)?);
     drop(conn);
 
     let filter_info = state.channel.lock().await;
@@ -159,8 +173,8 @@ async fn register_apns_nwc_impl(
     });
 
     info!(
-        "Registered APNS NWC wake connection id={} author={} tagged={} relay={} enabled={} watcher_filter_changed={}",
-        id, author, tagged, payload.relay, enabled, changed
+        "Registered {} NWC wake push connection id={} client_pubkey={} wallet_service_pubkey={} relay={} enabled={} watcher_filter_changed={}",
+        push_service, id, author, tagged, payload.relay, enabled, changed
     );
 
     Ok(())
@@ -189,11 +203,11 @@ pub async fn register(
     }
 }
 
-pub async fn register_apns_nwc(
+pub async fn register_nwc_push(
     origin: Option<TypedHeader<Origin>>,
     auth: Option<TypedHeader<Authorization<Bearer>>>,
     Extension(state): Extension<State>,
-    Json(mut payload): Json<RegisterApnsNwcRequest>,
+    Json(mut payload): Json<RegisterNwcPushRequest>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     if !state.self_hosted {
         validate_cors(origin)?;
@@ -206,9 +220,9 @@ pub async fn register_apns_nwc(
 
     ensure_id!(payload, auth_id);
 
-    match register_apns_nwc_impl(&state, payload).await {
+    match register_nwc_push_impl(&state, payload).await {
         Ok(res) => Ok(Json(res)),
-        Err(e) => Err(handle_anyhow_error("register_apns_nwc", e)),
+        Err(e) => Err(handle_anyhow_error("register_nwc_push", e)),
     }
 }
 
@@ -295,6 +309,16 @@ async fn wake_nwc_impl(state: &State, payload: NwcWakeRequest) -> anyhow::Result
             retry_after: None,
         });
     }
+    if !valid_nostr_event_id(&payload.event_id) {
+        return Ok(NwcWakeResponse::Rejected {
+            code: "not_allowed".to_string(),
+            message: "invalid event_id".to_string(),
+            retry_after: None,
+        });
+    }
+    if let Some(rejected) = validate_wake_event_freshness(payload.event_created_at)? {
+        return Ok(rejected);
+    }
 
     let Some(apns_client) = state.apns_client.clone() else {
         return Ok(NwcWakeResponse::Rejected {
@@ -304,36 +328,130 @@ async fn wake_nwc_impl(state: &State, payload: NwcWakeRequest) -> anyhow::Result
         });
     };
 
-    let mut conn = state.db_pool.get()?;
-    let registrations = ApnsNwcRegistration::find_by_nwc(
-        &mut conn,
-        payload.client_pubkey,
-        payload.wallet_service_pubkey,
-        &payload.relay,
-    )?;
+    let registrations = {
+        let mut conn = state.db_pool.get()?;
+        let registrations = NwcPushRegistration::find_apns_by_nwc(
+            &mut conn,
+            payload.client_pubkey,
+            payload.wallet_service_pubkey,
+            &payload.relay,
+        )?;
 
-    if registrations.is_empty() {
-        return Ok(NwcWakeResponse::Rejected {
-            code: "unknown_connection".to_string(),
-            message: "no registered wake connection matched this request".to_string(),
-            retry_after: None,
-        });
-    }
+        if registrations.is_empty() {
+            return Ok(NwcWakeResponse::Rejected {
+                code: "unknown_connection".to_string(),
+                message: "no registered wake connection matched this request".to_string(),
+                retry_after: None,
+            });
+        }
+
+        let recorded =
+            NwcWakeEvent::record_once(&mut conn, &payload.event_id, payload.event_created_at)?;
+        if !recorded {
+            return Ok(NwcWakeResponse::Rejected {
+                code: "replay".to_string(),
+                message: "wake event was already processed".to_string(),
+                retry_after: None,
+            });
+        }
+
+        registrations
+    };
 
     let wallet_service_pubkey = hex::encode(payload.wallet_service_pubkey.serialize());
-    for registration in registrations {
-        apns_client
+    let mut sent_count = 0usize;
+    let mut transient_failure_count = 0usize;
+    for registration in &registrations {
+        match apns_client
             .send_wake(
-                &registration,
+                registration,
                 &payload.relay,
                 &payload.event_id,
                 Some(&wallet_service_pubkey),
-                None,
             )
-            .await?;
+            .await
+        {
+            Ok(()) => sent_count += 1,
+            Err(err) => {
+                warn!(
+                    "Failed to send APNS nwc_wake push for event {} to {}: {}",
+                    payload.event_id, registration.id, err
+                );
+                if err.is_permanent() {
+                    let mut conn = state.db_pool.get()?;
+                    NwcPushRegistration::disable(&mut conn, registration)?;
+                    info!(
+                        "Disabled stale APNS NWC registration id={} author={} tagged={} relay={}",
+                        registration.id,
+                        registration.author,
+                        registration.tagged,
+                        registration.relay
+                    );
+                } else {
+                    transient_failure_count += 1;
+                }
+            }
+        }
+    }
+
+    if sent_count == 0 {
+        return Ok(NwcWakeResponse::Rejected {
+            code: "push_failed".to_string(),
+            message: "wake push could not be delivered".to_string(),
+            retry_after: if transient_failure_count > 0 {
+                Some(30)
+            } else {
+                None
+            },
+        });
     }
 
     Ok(NwcWakeResponse::Accepted)
+}
+
+fn valid_nostr_event_id(event_id: &str) -> bool {
+    event_id.len() == 64
+        && hex::decode(event_id)
+            .map(|bytes| bytes.len() == 32)
+            .unwrap_or(false)
+}
+
+fn validate_wake_event_freshness(
+    event_created_at: Option<u64>,
+) -> anyhow::Result<Option<NwcWakeResponse>> {
+    let Some(event_created_at) = event_created_at else {
+        return Ok(None);
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if event_created_at > now.saturating_add(NWC_WAKE_MAX_CLOCK_SKEW_SECS) {
+        return Ok(Some(NwcWakeResponse::Rejected {
+            code: "stale_event".to_string(),
+            message: "wake event is from the future".to_string(),
+            retry_after: None,
+        }));
+    }
+    if now.saturating_sub(event_created_at) > NWC_WAKE_MAX_EVENT_AGE_SECS {
+        return Ok(Some(NwcWakeResponse::Rejected {
+            code: "stale_event".to_string(),
+            message: "wake event is too old".to_string(),
+            retry_after: None,
+        }));
+    }
+    Ok(None)
+}
+
+fn validate_push_service(push_service: &str) -> anyhow::Result<()> {
+    match push_service {
+        PUSH_SERVICE_APNS | PUSH_SERVICE_FCM => Ok(()),
+        _ => anyhow::bail!("invalid push_service"),
+    }
+}
+
+fn validate_push_environment(environment: &str) -> anyhow::Result<()> {
+    match environment {
+        "sandbox" | "production" => Ok(()),
+        _ => anyhow::bail!("invalid push environment"),
+    }
 }
 
 pub async fn wake_nwc(

@@ -1,7 +1,8 @@
 use diesel_migrations::{embed_migrations, EmbeddedMigrations};
 
-pub mod apns_nwc_registration;
 pub mod nwc_pubkey;
+pub mod nwc_push_registration;
+pub mod nwc_wake_event;
 mod schema;
 pub mod subscription_info;
 

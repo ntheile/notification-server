@@ -1,15 +1,16 @@
 mod apns;
 mod auth;
+mod fcm;
 mod listener;
 mod models;
 mod routes;
 
 use crate::apns::ApnsPushClient;
-use crate::models::apns_nwc_registration::ApnsNwcRegistration;
 use crate::models::nwc_pubkey::{NwcFilterInfo, NwcPubkeys};
+use crate::models::nwc_push_registration::NwcPushRegistration;
 use crate::models::MIGRATIONS;
 use crate::routes::{
-    broadcast, health_check, register, register_apns_nwc, register_nwc, valid_origin,
+    broadcast, health_check, register, register_nwc, register_nwc_push, valid_origin,
     validate_cors, wake_nwc,
 };
 use axum::headers::Origin;
@@ -94,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("migrations could not run");
 
     let mut filter_info = NwcPubkeys::get_filter_info(&mut connection)?;
-    filter_info.merge(ApnsNwcRegistration::get_filter_info(&mut connection)?);
+    filter_info.merge(NwcPushRegistration::get_filter_info(&mut connection)?);
     println!(
         "Initial NWC watcher filter: authors={} wallet_pubkeys={} relays={}",
         filter_info.authors.len(),
@@ -143,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health-check", get(health_check))
         .route("/register", post(register))
         .route("/register-nwc", post(register_nwc))
-        .route("/register-apns-nwc", post(register_apns_nwc))
+        .route("/register-nwc-push", post(register_nwc_push))
         .route("/.well-known/nostr/nwc-wake", post(wake_nwc))
         .route("/broadcast", post(broadcast))
         .fallback(fallback)
