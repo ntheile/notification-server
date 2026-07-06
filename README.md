@@ -76,11 +76,5 @@ iOS/APNS uses `push_service = "apns"` with the APNS device token in
 `push_token`. Android/FCM is reserved in the schema, but the API currently
 rejects `push_service = "fcm"` until FCM delivery is wired up.
 
-The spec wake endpoint is also available at:
-
-```http
-POST /.well-known/nostr/nwc-wake
-```
-
 The wallet app will call `/register-nwc-push` automatically when
 `NWC_WAKE_SERVER_URL` is set in the iOS build environment.
