@@ -227,6 +227,7 @@ pub async fn register_nwc_push(
         &headers,
         &method,
         &uri,
+        state.public_base_url.as_deref(),
         &body,
         payload.wallet_service_pubkey,
     )?;
@@ -256,6 +257,7 @@ fn verify_nostr_http_auth(
     headers: &HeaderMap,
     method: &Method,
     uri: &Uri,
+    public_base_url: Option<&str>,
     body: &[u8],
     wallet_service_pubkey: XOnlyPublicKey,
 ) -> Result<(), (StatusCode, String)> {
@@ -331,7 +333,7 @@ fn verify_nostr_http_auth(
         ));
     }
 
-    let expected_url = effective_request_url(headers, uri)?;
+    let expected_url = effective_request_url(headers, uri, public_base_url)?;
     require_auth_tag(&event, "u", &expected_url)?;
     require_auth_tag(&event, "method", method.as_str())?;
 
@@ -357,39 +359,33 @@ fn require_auth_tag(event: &Event, name: &str, expected: &str) -> Result<(), (St
     }
 }
 
-fn effective_request_url(headers: &HeaderMap, uri: &Uri) -> Result<String, (StatusCode, String)> {
-    let host = forwarded_header(headers, "x-forwarded-host")
-        .or_else(|| header_value(headers, HOST.as_str()))
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized: host header required".to_string(),
-            )
-        })?;
-    let scheme = forwarded_header(headers, "x-forwarded-proto").unwrap_or_else(|| {
-        if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
-            "http".to_string()
-        } else {
-            "https".to_string()
-        }
-    });
+fn effective_request_url(
+    headers: &HeaderMap,
+    uri: &Uri,
+    public_base_url: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
     let path = uri
         .path_and_query()
         .map(|path| path.as_str())
         .unwrap_or("/");
 
-    Ok(format!("{scheme}://{host}{path}"))
-}
+    if let Some(public_base_url) = public_base_url {
+        return Ok(format!("{}{}", public_base_url.trim_end_matches('/'), path));
+    }
 
-fn forwarded_header(headers: &HeaderMap, name: &str) -> Option<String> {
-    header_value(headers, name).map(|value| {
-        value
-            .split(',')
-            .next()
-            .unwrap_or(value.as_str())
-            .trim()
-            .to_string()
-    })
+    let host = header_value(headers, HOST.as_str()).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized: host header required".to_string(),
+        )
+    })?;
+    let scheme = if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+        "http"
+    } else {
+        "https"
+    };
+
+    Ok(format!("{scheme}://{host}{path}"))
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {

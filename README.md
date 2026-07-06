@@ -34,11 +34,16 @@ amount, memo, or balance.
 Configure APNs token auth with:
 
 ```env
+PUBLIC_BASE_URL=https://YOUR_NOTIFICATION_SERVER
 APNS_TEAM_ID=...
 APNS_KEY_ID=...
 APNS_PRIVATE_KEY_PATH=/absolute/path/AuthKey_XXXXXXXXXX.p8
 # or APNS_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----..."
 ```
+
+`PUBLIC_BASE_URL` is recommended for public or tunneled deployments. It is used
+when verifying the signed Nostr `u` tag for `/register-nwc-push`; without it,
+the server derives the URL from the trusted `Host` header and request path.
 
 Register a wallet app install/NWC connection:
 

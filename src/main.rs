@@ -44,6 +44,7 @@ pub struct State {
     pub sig_builder: PartialVapidSignatureBuilder,
     pub auth_key: Option<PublicKey>,
     pub self_hosted: bool,
+    pub public_base_url: Option<String>,
     pub client: IsahcWebPushClient,
     pub apns_client: Option<ApnsPushClient>,
     pub channel: Arc<Mutex<watch::Sender<NwcFilterInfo>>>,
@@ -80,6 +81,18 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| p.parse::<u16>())
         .transpose()?
         .unwrap_or(8080);
+    let public_base_url = std::env::var("PUBLIC_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.starts_with("http://") || value.starts_with("https://") {
+                Ok(value)
+            } else {
+                anyhow::bail!("PUBLIC_BASE_URL must start with http:// or https://")
+            }
+        })
+        .transpose()?;
 
     // DB management
     let manager = ConnectionManager::<PgConnection>::new(&pg_url);
@@ -116,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         sig_builder: sig_builder.clone(),
         auth_key,
         self_hosted,
+        public_base_url,
         client: client.clone(),
         apns_client: apns_client.clone(),
         channel,
