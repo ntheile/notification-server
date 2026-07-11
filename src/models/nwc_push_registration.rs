@@ -141,6 +141,27 @@ impl NwcPushRegistration {
         Ok(())
     }
 
+    pub fn unregister(
+        conn: &mut PgConnection,
+        id: &str,
+        push_service: &str,
+        author: &str,
+        tagged: &str,
+        relay: &str,
+    ) -> anyhow::Result<usize> {
+        let deleted = diesel::delete(
+            nwc_push_registrations::table
+                .filter(nwc_push_registrations::id.eq(id))
+                .filter(nwc_push_registrations::push_service.eq(push_service))
+                .filter(nwc_push_registrations::author.eq(author))
+                .filter(nwc_push_registrations::tagged.eq(tagged))
+                .filter(nwc_push_registrations::relay.eq(relay)),
+        )
+        .execute(conn)?;
+
+        Ok(deleted)
+    }
+
     pub fn find_apns_by_nwc_event(
         conn: &mut PgConnection,
         event: &Event,

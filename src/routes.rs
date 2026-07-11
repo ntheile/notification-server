@@ -111,31 +111,45 @@ async fn register_nwc_push_impl(
     let id = payload.id.as_deref().expect("must have");
     let push_service = payload.push_service.trim().to_ascii_lowercase();
     validate_push_service(&push_service)?;
-    validate_push_environment(&payload.environment)?;
-    if payload.push_token.trim().is_empty() {
-        anyhow::bail!("push_token is required");
-    }
-    if payload.app_id.trim().is_empty() {
-        anyhow::bail!("app_id is required");
+    let enabled = payload.enabled.unwrap_or(true);
+    if enabled {
+        validate_push_environment(&payload.environment)?;
+        if payload.push_token.trim().is_empty() {
+            anyhow::bail!("push_token is required");
+        }
+        if payload.app_id.trim().is_empty() {
+            anyhow::bail!("app_id is required");
+        }
     }
 
     let author = hex::encode(payload.client_pubkey.serialize());
     let tagged = hex::encode(payload.wallet_service_pubkey.serialize());
-    let enabled = payload.enabled.unwrap_or(true);
 
-    NwcPushRegistration::register(
-        &mut conn,
-        id,
-        &push_service,
-        &payload.push_token,
-        &payload.app_id,
-        &payload.environment,
-        &author,
-        &tagged,
-        &payload.relay,
-        &payload.name,
-        enabled,
-    )?;
+    let deleted = if enabled {
+        NwcPushRegistration::register(
+            &mut conn,
+            id,
+            &push_service,
+            &payload.push_token,
+            &payload.app_id,
+            &payload.environment,
+            &author,
+            &tagged,
+            &payload.relay,
+            &payload.name,
+            true,
+        )?;
+        0
+    } else {
+        NwcPushRegistration::unregister(
+            &mut conn,
+            id,
+            &push_service,
+            &author,
+            &tagged,
+            &payload.relay,
+        )?
+    };
 
     let mut updated_filter_info = NwcPubkeys::get_filter_info(&mut conn)?;
     updated_filter_info.merge(NwcPushRegistration::get_filter_info(&mut conn)?);
@@ -151,10 +165,17 @@ async fn register_nwc_push_impl(
         }
     });
 
-    info!(
-        "Registered {} NWC wake push connection id={} client_pubkey={} wallet_service_pubkey={} relay={} enabled={} watcher_filter_changed={}",
-        push_service, id, author, tagged, payload.relay, enabled, changed
-    );
+    if enabled {
+        info!(
+            "Registered {} NWC wake push connection id={} client_pubkey={} wallet_service_pubkey={} relay={} watcher_filter_changed={}",
+            push_service, id, author, tagged, payload.relay, changed
+        );
+    } else {
+        info!(
+            "Unregistered {} NWC wake push connection id={} client_pubkey={} wallet_service_pubkey={} relay={} deleted={} watcher_filter_changed={}",
+            push_service, id, author, tagged, payload.relay, deleted, changed
+        );
+    }
 
     Ok(())
 }

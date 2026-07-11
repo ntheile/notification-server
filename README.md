@@ -71,6 +71,11 @@ The `Authorization` event follows NIP-98-style HTTP auth. It must be signed by
 `payload` tags for the request URL, `POST`, and the SHA-256 hash of the JSON
 body.
 
+Send the same authenticated payload with `"enabled": false` to unregister the
+installation and NWC connection from that relay. Unregistration deletes the
+matching row and is idempotent, so clients may persist and retry the request
+until the server confirms success.
+
 NWC push registrations are stored in the generic `nwc_push_registrations` table.
 iOS/APNS uses `push_service = "apns"` with the APNS device token in
 `push_token`. Android/FCM is reserved in the schema, but the API currently
