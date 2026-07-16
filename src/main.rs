@@ -20,7 +20,7 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::PgConnection;
 use diesel_migrations::MigrationHarness;
 use secp256k1::{All, PublicKey, Secp256k1};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{watch, Mutex};
 use tower_http::cors::{AllowMethods, AllowOrigin, CorsLayer};
 use web_push::{IsahcWebPushClient, PartialVapidSignatureBuilder, VapidSignatureBuilder};
@@ -36,6 +36,15 @@ const ALLOWED_ORIGINS: [&str; 6] = [
 
 const ALLOWED_SUBDOMAIN: &str = ".mutiny-web.pages.dev";
 const ALLOWED_LOCALHOST: &str = "http://127.0.0.1:";
+
+pub(crate) fn debug_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LOG")
+            .ok()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("debug"))
+    })
+}
 
 #[derive(Clone)]
 pub struct State {

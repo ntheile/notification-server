@@ -11,7 +11,7 @@ use nostr_sdk::{Client, RelayPoolNotification};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch::Receiver;
 use web_push::{
     ContentEncoding, IsahcWebPushClient, PartialVapidSignatureBuilder, Urgency, WebPushClient,
@@ -139,6 +139,11 @@ async fn handle_event(
     web_push_client: IsahcWebPushClient,
     apns_client: Option<ApnsPushClient>,
 ) -> anyhow::Result<()> {
+    let debug_logging = crate::debug_logging_enabled();
+    let handling_started_at = Instant::now();
+    let event_id = event.id.to_hex();
+    let event_age_ms = event_age_ms(&event);
+    let lookup_started_at = Instant::now();
     let (apns_registrations, subscription) = {
         let mut conn = db_pool.get()?;
         let apns_registrations =
@@ -146,6 +151,18 @@ async fn handle_event(
         let subscription = SubscriptionInfo::find_by_nwc_event(&mut conn, &event)?;
         (apns_registrations, subscription)
     };
+    let lookup_ms = lookup_started_at.elapsed().as_millis();
+    if debug_logging {
+        println!(
+            "NWC event routed: event_id={} relay={} event_age_ms={} db_lookup_ms={} apns_registrations={} web_push_match={}",
+            event_id,
+            relay,
+            event_age_ms,
+            lookup_ms,
+            apns_registrations.len(),
+            subscription.is_some()
+        );
+    }
 
     if let Some(apns_client) = apns_client {
         if apns_registrations.is_empty() {
@@ -159,54 +176,93 @@ async fn handle_event(
         } else {
             let inserted = {
                 let mut conn = db_pool.get()?;
-                NwcWakeEvent::record_once(
-                    &mut conn,
-                    &event.id.to_hex(),
-                    Some(event.created_at.as_u64()),
-                )?
+                NwcWakeEvent::record_once(&mut conn, &event_id, Some(event.created_at.as_u64()))?
             };
 
             if !inserted {
                 info!(
                     "Skipping duplicate APNS nwc_wake event from relay {}: event_id={}",
-                    relay,
-                    event.id.to_hex()
+                    relay, event_id
                 );
+                if debug_logging {
+                    println!(
+                        "APNS wake deduplicated: event_id={} relay={} total_ms={}",
+                        event_id,
+                        relay,
+                        handling_started_at.elapsed().as_millis()
+                    );
+                }
                 return Ok(());
             }
         }
 
         for registration in &apns_registrations {
-            println!(
-                "Sending APNS nwc_wake push for event {} to {}",
-                event.id.to_hex(),
-                registration.id
-            );
+            let send_started_at = Instant::now();
+            if debug_logging {
+                println!(
+                    "APNS wake sending: event_id={} registration_id={} relay={} event_age_ms={} pre_send_ms={}",
+                    event_id,
+                    registration.id,
+                    relay,
+                    event_age_ms,
+                    handling_started_at.elapsed().as_millis()
+                );
+            } else {
+                println!(
+                    "Sending APNS nwc_wake push for event {} to {}",
+                    event_id, registration.id
+                );
+            }
             info!(
                 "Sending APNS nwc_wake push for event {} to {}",
-                event.id.to_hex(),
-                registration.id
+                event_id, registration.id
             );
-            if let Err(err) = apns_client
+            match apns_client
                 .send_wake_for_event(registration, &event, &relay)
                 .await
             {
-                warn!(
-                    "Failed to send APNS nwc_wake push for event {} to {}: {}",
-                    event.id.to_hex(),
-                    registration.id,
-                    err
-                );
-                if err.is_permanent() {
-                    let mut conn = db_pool.get()?;
-                    NwcPushRegistration::disable(&mut conn, registration)?;
-                    info!(
-                        "Disabled stale APNS NWC registration id={} author={} tagged={} relay={}",
-                        registration.id,
-                        registration.author,
-                        registration.tagged,
-                        registration.relay
+                Ok(receipt) => {
+                    if debug_logging {
+                        println!(
+                            "APNS wake accepted: event_id={} registration_id={} relay={} apns_id={} payload_bytes={} embedded_event={} apns_ms={} total_ms={}",
+                            event_id,
+                            registration.id,
+                            relay,
+                            receipt.apns_id.as_deref().unwrap_or("<missing>"),
+                            receipt.payload_bytes,
+                            receipt.embedded_event,
+                            send_started_at.elapsed().as_millis(),
+                            handling_started_at.elapsed().as_millis()
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to send APNS nwc_wake push for event {} to {}: {}",
+                        event_id, registration.id, err
                     );
+                    if debug_logging {
+                        eprintln!(
+                            "APNS wake failed: event_id={} registration_id={} relay={} apns_ms={} total_ms={} error={}",
+                            event_id,
+                            registration.id,
+                            relay,
+                            send_started_at.elapsed().as_millis(),
+                            handling_started_at.elapsed().as_millis(),
+                            err
+                        );
+                    }
+                    if err.is_permanent() {
+                        let mut conn = db_pool.get()?;
+                        NwcPushRegistration::disable(&mut conn, registration)?;
+                        info!(
+                            "Disabled stale APNS NWC registration id={} author={} tagged={} relay={}",
+                            registration.id,
+                            registration.author,
+                            registration.tagged,
+                            registration.relay
+                        );
+                    }
                 }
             }
         }
@@ -253,6 +309,14 @@ async fn handle_event(
     web_push_client.send(builder.build()?).await?;
 
     Ok(())
+}
+
+fn event_age_ms(event: &Event) -> u128 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.saturating_sub(Duration::from_secs(event.created_at.as_u64()))
+        .as_millis()
 }
 
 fn wallet_service_pubkey(event: &Event) -> Option<String> {

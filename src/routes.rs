@@ -153,6 +153,9 @@ async fn register_nwc_push_impl(
 
     let mut updated_filter_info = NwcPubkeys::get_filter_info(&mut conn)?;
     updated_filter_info.merge(NwcPushRegistration::get_filter_info(&mut conn)?);
+    let active_clients = updated_filter_info.authors.len();
+    let active_wallets = updated_filter_info.tagged.len();
+    let active_relays = updated_filter_info.relays.len();
     drop(conn);
 
     let filter_info = state.channel.lock().await;
@@ -166,11 +169,40 @@ async fn register_nwc_push_impl(
     });
 
     if enabled {
+        if crate::debug_logging_enabled() {
+            println!(
+                "NWC push registration updated: operation=register push_service={} registration_id={} client_pubkey={} wallet_service_pubkey={} relay={} active_clients={} active_wallets={} active_relays={} watcher_filter_changed={}",
+                push_service,
+                id,
+                author,
+                tagged,
+                payload.relay,
+                active_clients,
+                active_wallets,
+                active_relays,
+                changed
+            );
+        }
         info!(
             "Registered {} NWC wake push connection id={} client_pubkey={} wallet_service_pubkey={} relay={} watcher_filter_changed={}",
             push_service, id, author, tagged, payload.relay, changed
         );
     } else {
+        if crate::debug_logging_enabled() {
+            println!(
+                "NWC push registration updated: operation=unregister push_service={} registration_id={} client_pubkey={} wallet_service_pubkey={} relay={} deleted={} active_clients={} active_wallets={} active_relays={} watcher_filter_changed={}",
+                push_service,
+                id,
+                author,
+                tagged,
+                payload.relay,
+                deleted,
+                active_clients,
+                active_wallets,
+                active_relays,
+                changed
+            );
+        }
         info!(
             "Unregistered {} NWC wake push connection id={} client_pubkey={} wallet_service_pubkey={} relay={} deleted={} watcher_filter_changed={}",
             push_service, id, author, tagged, payload.relay, deleted, changed

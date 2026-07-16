@@ -14,6 +14,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const APNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_APNS_PAYLOAD_BYTES: usize = 4096;
 
+#[derive(Debug)]
+pub struct ApnsSendReceipt {
+    pub apns_id: Option<String>,
+    pub payload_bytes: usize,
+    pub embedded_event: bool,
+}
+
 #[derive(Clone)]
 pub struct ApnsPushClient {
     http: reqwest::Client,
@@ -104,7 +111,7 @@ impl ApnsPushClient {
         registration: &NwcPushRegistration,
         event: &Event,
         relay: &str,
-    ) -> std::result::Result<(), ApnsSendError> {
+    ) -> std::result::Result<ApnsSendReceipt, ApnsSendError> {
         let event_json = serde_json::to_string(event)
             .map_err(|e| ApnsSendError::Build(format!("failed to serialize NWC event: {e}")))?;
 
@@ -124,7 +131,7 @@ impl ApnsPushClient {
         relay: &str,
         event_id: &str,
         wallet_service_pubkey: Option<&str>,
-    ) -> std::result::Result<(), ApnsSendError> {
+    ) -> std::result::Result<ApnsSendReceipt, ApnsSendError> {
         self.send_wake_inner(registration, relay, event_id, wallet_service_pubkey, None)
             .await
     }
@@ -136,7 +143,7 @@ impl ApnsPushClient {
         event_id: &str,
         wallet_service_pubkey: Option<&str>,
         nwc_event: Option<String>,
-    ) -> std::result::Result<(), ApnsSendError> {
+    ) -> std::result::Result<ApnsSendReceipt, ApnsSendError> {
         let wallet_service_pubkey = wallet_service_pubkey.unwrap_or(&registration.tagged);
         let token = registration
             .push_token
@@ -151,6 +158,7 @@ impl ApnsPushClient {
             .auth_token()
             .map_err(|e| ApnsSendError::Build(format!("failed to create APNS auth token: {e}")))?;
 
+        let mut embedded_event = nwc_event.is_some();
         let mut payload =
             wake_payload(relay, event_id, wallet_service_pubkey, nwc_event.as_deref());
         if nwc_event.is_some() && payload_size(&payload)? > MAX_APNS_PAYLOAD_BYTES {
@@ -159,6 +167,7 @@ impl ApnsPushClient {
                 event_id, MAX_APNS_PAYLOAD_BYTES
             );
             payload = wake_payload(relay, event_id, wallet_service_pubkey, None);
+            embedded_event = false;
         }
         let size = payload_size(&payload)?;
         if size > MAX_APNS_PAYLOAD_BYTES {
@@ -189,6 +198,11 @@ impl ApnsPushClient {
             .await
             .map_err(ApnsSendError::Request)?;
         let status = response.status();
+        let apns_id = response
+            .headers()
+            .get("apns-id")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             if is_permanent_apns_failure(status) {
@@ -197,7 +211,11 @@ impl ApnsPushClient {
             return Err(ApnsSendError::Transient { status, body });
         }
 
-        Ok(())
+        Ok(ApnsSendReceipt {
+            apns_id,
+            payload_bytes: size,
+            embedded_event,
+        })
     }
 
     fn auth_token(&self) -> Result<String> {
