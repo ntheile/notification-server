@@ -3,15 +3,15 @@ mod auth;
 mod fcm;
 mod listener;
 mod models;
+mod nwc;
 mod routes;
 
 use crate::apns::ApnsPushClient;
 use crate::models::nwc_pubkey::{NwcFilterInfo, NwcPubkeys};
 use crate::models::nwc_push_registration::NwcPushRegistration;
 use crate::models::MIGRATIONS;
-use crate::routes::{
-    broadcast, health_check, register, register_nwc, register_nwc_push, valid_origin, validate_cors,
-};
+use crate::nwc::{register_nwc, register_nwc_push};
+use crate::routes::{broadcast, health_check, register, valid_origin, validate_cors};
 use axum::headers::Origin;
 use axum::http::{header, request::Parts, HeaderValue, StatusCode, Uri};
 use axum::routing::{get, post};
