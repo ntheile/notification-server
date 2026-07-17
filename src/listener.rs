@@ -57,6 +57,7 @@ pub async fn start_listener(
 
         let nwc_requests = Filter::new()
             .kind(Kind::WalletConnectRequest)
+            .authors(filter.authors)
             .pubkeys(filter.tagged)
             .since(Timestamp::now());
 
