@@ -5,13 +5,12 @@ mod listener;
 mod models;
 mod nwc;
 mod routes;
-mod settlement_monitor;
 
 use crate::apns::ApnsPushClient;
 use crate::models::nwc_pubkey::{NwcFilterInfo, NwcPubkeys};
 use crate::models::nwc_push_registration::NwcPushRegistration;
 use crate::models::MIGRATIONS;
-use crate::nwc::{monitor_nwc_invoice, register_nwc, register_nwc_push};
+use crate::nwc::{register_nwc, register_nwc_push};
 use crate::routes::{broadcast, health_check, register, valid_origin, validate_cors};
 use axum::headers::Origin;
 use axum::http::{header, request::Parts, HeaderValue, StatusCode, Uri};
@@ -168,7 +167,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/register", post(register))
         .route("/register-nwc", post(register_nwc))
         .route("/register-nwc-push", post(register_nwc_push))
-        .route("/monitor-nwc-invoice", post(monitor_nwc_invoice))
         .route("/broadcast", post(broadcast))
         .fallback(fallback)
         .layer(
@@ -184,15 +182,6 @@ async fn main() -> anyhow::Result<()> {
     println!("Webserver running on http://{addr}");
 
     // start the listener
-    if let Some(monitor_apns) = apns_client.clone() {
-        let monitor_pool = db_pool.clone();
-        tokio::spawn(async move {
-            if let Err(error) = settlement_monitor::run(monitor_pool, monitor_apns).await {
-                eprintln!("settlement monitor error: {error}");
-            }
-        });
-    }
-
     tokio::spawn(async move {
         loop {
             if let Err(e) = listener::start_listener(
