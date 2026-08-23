@@ -121,6 +121,7 @@ impl ApnsPushClient {
             &event.id.to_hex(),
             wallet_service_pubkey(event).as_deref(),
             Some(event_json),
+            false,
         )
         .await
     }
@@ -132,8 +133,33 @@ impl ApnsPushClient {
         event_id: &str,
         wallet_service_pubkey: Option<&str>,
     ) -> std::result::Result<ApnsSendReceipt, ApnsSendError> {
-        self.send_wake_inner(registration, relay, event_id, wallet_service_pubkey, None)
-            .await
+        self.send_wake_inner(
+            registration,
+            relay,
+            event_id,
+            wallet_service_pubkey,
+            None,
+            false,
+        )
+        .await
+    }
+
+    pub async fn send_settlement_check(
+        &self,
+        registration: &NwcPushRegistration,
+        relay: &str,
+        event_id: &str,
+        wallet_service_pubkey: &str,
+    ) -> std::result::Result<ApnsSendReceipt, ApnsSendError> {
+        self.send_wake_inner(
+            registration,
+            relay,
+            event_id,
+            Some(wallet_service_pubkey),
+            None,
+            true,
+        )
+        .await
     }
 
     async fn send_wake_inner(
@@ -143,6 +169,7 @@ impl ApnsPushClient {
         event_id: &str,
         wallet_service_pubkey: Option<&str>,
         nwc_event: Option<String>,
+        settlement_check: bool,
     ) -> std::result::Result<ApnsSendReceipt, ApnsSendError> {
         let wallet_service_pubkey = wallet_service_pubkey.unwrap_or(&registration.tagged);
         let token = registration
@@ -159,14 +186,25 @@ impl ApnsPushClient {
             .map_err(|e| ApnsSendError::Build(format!("failed to create APNS auth token: {e}")))?;
 
         let mut embedded_event = nwc_event.is_some();
-        let mut payload =
-            wake_payload(relay, event_id, wallet_service_pubkey, nwc_event.as_deref());
+        let mut payload = wake_payload(
+            relay,
+            event_id,
+            wallet_service_pubkey,
+            nwc_event.as_deref(),
+            settlement_check,
+        );
         if nwc_event.is_some() && payload_size(&payload)? > MAX_APNS_PAYLOAD_BYTES {
             warn!(
                 "Omitting embedded NWC event from APNS wake payload for event {} because it exceeds {} bytes",
                 event_id, MAX_APNS_PAYLOAD_BYTES
             );
-            payload = wake_payload(relay, event_id, wallet_service_pubkey, None);
+            payload = wake_payload(
+                relay,
+                event_id,
+                wallet_service_pubkey,
+                None,
+                settlement_check,
+            );
             embedded_event = false;
         }
         let size = payload_size(&payload)?;
@@ -189,6 +227,11 @@ impl ApnsPushClient {
         );
         headers.insert("apns-push-type", HeaderValue::from_static("alert"));
         headers.insert("apns-priority", HeaderValue::from_static("10"));
+        headers.insert(
+            "apns-collapse-id",
+            HeaderValue::from_str(event_id)
+                .map_err(|e| ApnsSendError::Build(format!("invalid APNS collapse id: {e}")))?,
+        );
         let response = self
             .http
             .post(endpoint)
@@ -261,12 +304,18 @@ fn wake_payload(
     event_id: &str,
     wallet_service_pubkey: &str,
     nwc_event: Option<&str>,
+    settlement_check: bool,
 ) -> serde_json::Value {
+    let body = if settlement_check {
+        "Checking incoming payment"
+    } else {
+        "Received 1 Event"
+    };
     let mut payload = json!({
         "aps": {
             "alert": {
                 "title": "Nostr Connect",
-                "body": "Received 1 Event"
+                "body": body
             },
             "mutable-content": 1,
             "content-available": 1
@@ -279,6 +328,9 @@ fn wake_payload(
     });
     if let Some(nwc_event) = nwc_event {
         payload["nwc_event"] = json!(nwc_event);
+    }
+    if settlement_check {
+        payload["settlement_check"] = json!(true);
     }
     payload
 }
