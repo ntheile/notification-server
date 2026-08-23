@@ -13,7 +13,6 @@ use chrono::{Duration, TimeZone, Utc};
 use log::info;
 use nostr::key::XOnlyPublicKey;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterNwcRequest {
@@ -47,13 +46,6 @@ pub struct MonitorNwcInvoiceRequest {
     pub relay: String,
     pub expires_at: u64,
     pub enabled: bool,
-    pub trigger_token_hash: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct TriggerNwcInvoiceRequest {
-    pub request_event_id: String,
-    pub trigger_token: String,
 }
 
 async fn refresh_watcher_filter(state: &State) -> anyhow::Result<(usize, usize, usize, bool)> {
@@ -270,7 +262,6 @@ pub async fn monitor_nwc_invoice(
     let client = hex::encode(payload.client_pubkey.serialize());
     let wallet = hex::encode(payload.wallet_service_pubkey.serialize());
     let request_event_id = payload.request_event_id.to_ascii_lowercase();
-    let trigger_token_hash = payload.trigger_token_hash.to_ascii_lowercase();
     if payload.enabled {
         let registrations = NwcPushRegistration::find_apns_by_nwc(
             &mut conn,
@@ -302,7 +293,6 @@ pub async fn monitor_nwc_invoice(
             &wallet,
             &payload.relay,
             expires_at,
-            &trigger_token_hash,
         )
         .map_err(|error| handle_anyhow_error("monitor_nwc_invoice", error))?;
     } else {
@@ -318,52 +308,6 @@ pub async fn monitor_nwc_invoice(
     Ok(Json(()))
 }
 
-/// Accepts a single-invoice bearer capability from the Bark mailbox hook.
-///
-/// The endpoint intentionally returns the same status for valid, expired, and
-/// unknown monitors so public Nostr event ids cannot be used as an oracle.
-pub async fn trigger_nwc_invoice(
-    Extension(state): Extension<State>,
-    Json(payload): Json<TriggerNwcInvoiceRequest>,
-) -> Result<StatusCode, HttpError> {
-    if payload.request_event_id.len() != 64
-        || !payload
-            .request_event_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-        || payload.trigger_token.len() != 64
-        || !payload
-            .trigger_token
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "invalid settlement trigger".to_string(),
-        ));
-    }
-    let trigger_token_hash = settlement_trigger_token_hash(&payload.trigger_token).ok_or((
-        StatusCode::BAD_REQUEST,
-        "invalid settlement trigger".to_string(),
-    ))?;
-    let mut conn = state
-        .db_pool
-        .get()
-        .map_err(|error| handle_anyhow_error("trigger_nwc_invoice", error.into()))?;
-    let _ = NwcInvoiceMonitor::signal_settlement(
-        &mut conn,
-        &payload.request_event_id.to_ascii_lowercase(),
-        &trigger_token_hash,
-    )
-    .map_err(|error| handle_anyhow_error("trigger_nwc_invoice", error))?;
-    Ok(StatusCode::ACCEPTED)
-}
-
-fn settlement_trigger_token_hash(token_hex: &str) -> Option<String> {
-    let token = hex::decode(token_hex).ok()?;
-    (token.len() == 32).then(|| hex::encode(Sha256::digest(token)))
-}
-
 fn validate_monitor_request(payload: &MonitorNwcInvoiceRequest) -> Result<(), HttpError> {
     if payload.id.trim().is_empty() || payload.id.len() > 2_048 {
         return Err((StatusCode::BAD_REQUEST, "invalid id".to_string()));
@@ -377,17 +321,6 @@ fn validate_monitor_request(payload: &MonitorNwcInvoiceRequest) -> Result<(), Ht
         return Err((
             StatusCode::BAD_REQUEST,
             "invalid request_event_id".to_string(),
-        ));
-    }
-    if payload.trigger_token_hash.len() != 64
-        || !payload
-            .trigger_token_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "invalid trigger_token_hash".to_string(),
         ));
     }
     if payload.relay.len() > 2_048
@@ -410,21 +343,6 @@ fn validate_monitor_request(payload: &MonitorNwcInvoiceRequest) -> Result<(), Ht
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod settlement_tests {
-    use super::settlement_trigger_token_hash;
-
-    #[test]
-    fn settlement_trigger_hashes_exactly_32_random_bytes() {
-        assert_eq!(
-            settlement_trigger_token_hash(&"01".repeat(32)),
-            Some("72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793".to_string())
-        );
-        assert!(settlement_trigger_token_hash("01").is_none());
-        assert!(settlement_trigger_token_hash(&"zz".repeat(32)).is_none());
-    }
 }
 
 fn parse_json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, HttpError> {
@@ -521,7 +439,6 @@ mod tests {
             relay: "wss://relay.example.com".to_string(),
             expires_at: (Utc::now() + Duration::hours(1)).timestamp() as u64,
             enabled: true,
-            trigger_token_hash: "cd".repeat(32),
         }
     }
 

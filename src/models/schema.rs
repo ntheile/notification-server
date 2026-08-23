@@ -13,10 +13,6 @@ diesel::table! {
         enabled -> Bool,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
-        trigger_token_hash -> Nullable<Text>,
-        settlement_signaled_at -> Nullable<Timestamptz>,
-        silent_sent_at -> Nullable<Timestamptz>,
-        alert_sent_at -> Nullable<Timestamptz>,
     }
 }
 

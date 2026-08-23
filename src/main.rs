@@ -11,7 +11,7 @@ use crate::apns::ApnsPushClient;
 use crate::models::nwc_pubkey::{NwcFilterInfo, NwcPubkeys};
 use crate::models::nwc_push_registration::NwcPushRegistration;
 use crate::models::MIGRATIONS;
-use crate::nwc::{monitor_nwc_invoice, register_nwc, register_nwc_push, trigger_nwc_invoice};
+use crate::nwc::{monitor_nwc_invoice, register_nwc, register_nwc_push};
 use crate::routes::{broadcast, health_check, register, valid_origin, validate_cors};
 use axum::headers::Origin;
 use axum::http::{header, request::Parts, HeaderValue, StatusCode, Uri};
@@ -169,7 +169,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/register-nwc", post(register_nwc))
         .route("/register-nwc-push", post(register_nwc_push))
         .route("/monitor-nwc-invoice", post(monitor_nwc_invoice))
-        .route("/trigger-nwc-invoice", post(trigger_nwc_invoice))
         .route("/broadcast", post(broadcast))
         .fallback(fallback)
         .layer(

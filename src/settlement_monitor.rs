@@ -1,5 +1,5 @@
 use crate::apns::ApnsPushClient;
-use crate::models::nwc_invoice_monitor::{NwcInvoiceMonitor, SettlementDelivery};
+use crate::models::nwc_invoice_monitor::NwcInvoiceMonitor;
 use crate::models::nwc_push_registration::NwcPushRegistration;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::PgConnection;
@@ -21,8 +21,7 @@ pub async fn run(
             NwcInvoiceMonitor::disable_exhausted(&mut conn)?;
             NwcInvoiceMonitor::claim_due(&mut conn, CLAIM_BATCH_SIZE)?
         };
-        for claimed in due {
-            let monitor = claimed.monitor;
+        for monitor in due {
             let registration = {
                 let mut conn = pool.get()?;
                 NwcPushRegistration::find_apns_for_monitor(
@@ -44,42 +43,26 @@ pub async fn run(
                 )?;
                 continue;
             };
-            let result = match claimed.delivery {
-                SettlementDelivery::Background => {
-                    apns.send_settlement_background(
-                        &registration,
-                        &monitor.relay,
-                        &monitor.request_event_id,
-                        &monitor.wallet_service_pubkey,
-                    )
-                    .await
-                }
-                SettlementDelivery::AlertFallback => {
-                    apns.send_settlement_alert(
-                        &registration,
-                        &monitor.relay,
-                        &monitor.request_event_id,
-                        &monitor.wallet_service_pubkey,
-                    )
-                    .await
-                }
-            };
-            match result {
-                Ok(receipt) => {
-                    let mut conn = pool.get()?;
-                    NwcInvoiceMonitor::mark_delivered(&mut conn, &monitor, claimed.delivery)?;
-                    info!(
-                        "NWC settlement wake accepted event_id={} registration_id={} delivery={:?} payload_bytes={}",
-                        monitor.request_event_id,
-                        monitor.id,
-                        claimed.delivery,
-                        receipt.payload_bytes
-                    );
-                }
+            match apns
+                .send_settlement_check(
+                    &registration,
+                    &monitor.relay,
+                    &monitor.request_event_id,
+                    &monitor.wallet_service_pubkey,
+                )
+                .await
+            {
+                Ok(receipt) => info!(
+                    "Scheduled NWC invoice check accepted event_id={} registration_id={} wake_count={} payload_bytes={}",
+                    monitor.request_event_id,
+                    monitor.id,
+                    monitor.wake_count.saturating_add(1),
+                    receipt.payload_bytes
+                ),
                 Err(error) => {
                     warn!(
-                        "NWC settlement wake failed event_id={} registration_id={} delivery={:?} error={}",
-                        monitor.request_event_id, monitor.id, claimed.delivery, error
+                        "Scheduled NWC invoice check failed event_id={} registration_id={} error={}",
+                        monitor.request_event_id, monitor.id, error
                     );
                     if error.is_permanent() {
                         let mut conn = pool.get()?;
@@ -91,9 +74,6 @@ pub async fn run(
                             &monitor.wallet_service_pubkey,
                             &monitor.relay,
                         )?;
-                    } else {
-                        let mut conn = pool.get()?;
-                        NwcInvoiceMonitor::retry_delivery(&mut conn, &monitor, claimed.delivery)?;
                     }
                 }
             }
