@@ -56,6 +56,7 @@ impl NwcInvoiceMonitor {
             .on_conflict((
                 nwc_invoice_monitors::id,
                 nwc_invoice_monitors::request_event_id,
+                nwc_invoice_monitors::wallet_service_pubkey,
                 nwc_invoice_monitors::relay,
             ))
             .do_update()
@@ -118,6 +119,10 @@ impl NwcInvoiceMonitor {
                         .filter(nwc_invoice_monitors::id.eq(&monitor.id))
                         .filter(
                             nwc_invoice_monitors::request_event_id.eq(&monitor.request_event_id),
+                        )
+                        .filter(
+                            nwc_invoice_monitors::wallet_service_pubkey
+                                .eq(&monitor.wallet_service_pubkey),
                         )
                         .filter(nwc_invoice_monitors::relay.eq(&monitor.relay)),
                 )

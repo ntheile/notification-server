@@ -19,7 +19,7 @@ CREATE TABLE nwc_invoice_monitors
         CHECK (wallet_service_pubkey ~ '^[0-9a-f]{64}$'),
     CONSTRAINT nwc_invoice_monitors_wake_count_check
         CHECK (wake_count BETWEEN 0 AND 64),
-    PRIMARY KEY (id, request_event_id, relay)
+    PRIMARY KEY (id, request_event_id, wallet_service_pubkey, relay)
 );
 
 CREATE INDEX nwc_invoice_monitors_due_idx

@@ -1,7 +1,7 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
-    nwc_invoice_monitors (id, request_event_id, relay) {
+    nwc_invoice_monitors (id, request_event_id, wallet_service_pubkey, relay) {
         id -> Text,
         request_event_id -> Text,
         client_pubkey -> Text,
