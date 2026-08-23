@@ -2,6 +2,8 @@ use crate::models::schema::nwc_invoice_monitors;
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 
+const SETTLEMENT_BACKGROUND_GRACE_SECONDS: i64 = 35;
+
 #[allow(dead_code)]
 #[derive(Queryable, Debug, Clone)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -205,9 +207,10 @@ impl NwcInvoiceMonitor {
             SettlementDelivery::Background => Ok(diesel::update(target)
                 .set((
                     nwc_invoice_monitors::silent_sent_at.eq(now),
-                    // Give the invisible app wake time to publish and acknowledge
-                    // before falling back to the killed-app NSE path.
-                    nwc_invoice_monitors::next_wake_at.eq(now + Duration::seconds(10)),
+                    // The app's bounded execution window is 28 seconds. Leave
+                    // additional APNs/network margin before showing a fallback.
+                    nwc_invoice_monitors::next_wake_at
+                        .eq(now + Duration::seconds(SETTLEMENT_BACKGROUND_GRACE_SECONDS)),
                     nwc_invoice_monitors::updated_at.eq(diesel::dsl::now),
                 ))
                 .execute(conn)?),
