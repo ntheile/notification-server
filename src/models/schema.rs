@@ -1,6 +1,22 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    nwc_invoice_monitors (id, request_event_id, relay) {
+        id -> Text,
+        request_event_id -> Text,
+        client_pubkey -> Text,
+        wallet_service_pubkey -> Text,
+        relay -> Text,
+        expires_at -> Timestamptz,
+        next_wake_at -> Timestamptz,
+        wake_count -> Int4,
+        enabled -> Bool,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     nwc_push_registrations (id, push_service, author, tagged, relay) {
         id -> Text,
         push_service -> Text,
@@ -49,6 +65,7 @@ diesel::table! {
 diesel::joinable!(nwc_pubkeys -> subscription_info (id));
 
 diesel::allow_tables_to_appear_in_same_query!(
+    nwc_invoice_monitors,
     nwc_push_registrations,
     nwc_wake_events,
     nwc_pubkeys,
