@@ -13,3 +13,7 @@ CREATE INDEX nwc_invoice_monitors_due_idx
     WHERE enabled = TRUE
       AND settlement_signaled_at IS NOT NULL
       AND alert_sent_at IS NULL;
+
+CREATE INDEX nwc_invoice_monitors_trigger_idx
+    ON nwc_invoice_monitors (request_event_id, trigger_token_hash)
+    WHERE enabled = TRUE;

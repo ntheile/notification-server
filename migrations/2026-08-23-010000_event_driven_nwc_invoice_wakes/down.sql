@@ -1,4 +1,5 @@
 DROP INDEX nwc_invoice_monitors_due_idx;
+DROP INDEX nwc_invoice_monitors_trigger_idx;
 
 ALTER TABLE nwc_invoice_monitors
     DROP CONSTRAINT nwc_invoice_monitors_trigger_hash_check,
