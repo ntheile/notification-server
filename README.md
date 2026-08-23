@@ -88,3 +88,25 @@ rejects `push_service = "fcm"` until FCM delivery is wired up.
 
 The wallet app will call `/register-nwc-push` automatically when
 `NWC_WAKE_SERVER_URL` is set in the iOS build environment.
+
+### Event-driven invoice settlement
+
+For an invoice created through NWC, the wallet registers a short-lived monitor
+with `POST /monitor-nwc-invoice`. The authenticated request includes the NWC
+request event id, approved relay, expiry, and a SHA-256 commitment to a random
+32-byte per-invoice trigger token. The server stores the commitment, not the
+token, and registration alone never schedules a wake.
+
+When Bark observes that invoice settle in its durable mailbox, its server-side
+hook sends the request event id and raw token once to
+`POST /trigger-nwc-invoice`. A matching active monitor causes this server to:
+
+1. send one silent APNs background wake;
+2. wait 35 seconds for Rebel Wallet to publish the NIP-47 notification and
+   disable the monitor; and
+3. send one mutable visible alert only if the silent path was not acknowledged.
+
+The trigger endpoint returns `202 Accepted` for validly formatted capabilities
+whether or not a live monitor matched, so event ids cannot be used as a monitor
+existence oracle. Trigger tokens are single-invoice bearer capabilities and
+must only be sent over HTTPS.
