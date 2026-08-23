@@ -191,6 +191,30 @@ impl NwcPushRegistration {
         Self::find_by_nwc_service(conn, PUSH_SERVICE_APNS, author, tagged, relay)
     }
 
+    pub fn find_apns_for_monitor(
+        conn: &mut PgConnection,
+        id: &str,
+        author: &str,
+        tagged: &str,
+        relay: &str,
+    ) -> anyhow::Result<Option<Self>> {
+        let relay_without_trailing_slash = relay.trim_end_matches('/');
+        let relay_with_trailing_slash = format!("{relay_without_trailing_slash}/");
+        Ok(nwc_push_registrations::table
+            .filter(nwc_push_registrations::enabled.eq(true))
+            .filter(nwc_push_registrations::push_service.eq(PUSH_SERVICE_APNS))
+            .filter(nwc_push_registrations::id.eq(id))
+            .filter(nwc_push_registrations::author.eq(author))
+            .filter(nwc_push_registrations::tagged.eq(tagged))
+            .filter(
+                nwc_push_registrations::relay
+                    .eq(relay_without_trailing_slash)
+                    .or(nwc_push_registrations::relay.eq(relay_with_trailing_slash)),
+            )
+            .first::<Self>(conn)
+            .optional()?)
+    }
+
     fn find_by_nwc_service(
         conn: &mut PgConnection,
         push_service: &str,

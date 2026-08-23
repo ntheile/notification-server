@@ -1,5 +1,6 @@
 use diesel_migrations::{embed_migrations, EmbeddedMigrations};
 
+pub mod nwc_invoice_monitor;
 pub mod nwc_pubkey;
 pub mod nwc_push_registration;
 pub mod nwc_wake_event;
@@ -11,6 +12,7 @@ pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::models::nwc_invoice_monitor::NwcInvoiceMonitor;
     use crate::models::nwc_pubkey::NwcPubkeys;
     use crate::models::nwc_push_registration::{NwcPushRegistration, PUSH_SERVICE_APNS};
     use crate::models::subscription_info::SubscriptionInfo;
@@ -55,6 +57,7 @@ mod test {
         let conn = &mut db_pool.get().unwrap();
 
         conn.transaction::<_, anyhow::Error, _>(|conn| {
+            diesel::delete(schema::nwc_invoice_monitors::table).execute(conn)?;
             diesel::delete(schema::nwc_wake_events::table).execute(conn)?;
             diesel::delete(schema::nwc_push_registrations::table).execute(conn)?;
             diesel::delete(schema::nwc_pubkeys::table).execute(conn)?;
@@ -192,6 +195,54 @@ mod test {
         .unwrap();
         assert_eq!(deleted_again, 0);
 
+        clear_database(&db_pool);
+    }
+
+    #[tokio::test]
+    async fn invoice_monitor_is_idempotent_and_wallet_bound() {
+        let _guard = lock_test_database();
+        let db_pool = init_db_pool();
+        clear_database(&db_pool);
+        let mut conn = db_pool.get().unwrap();
+        let event_id = "ab".repeat(32);
+        let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        NwcInvoiceMonitor::enable(
+            &mut conn,
+            "install-id",
+            &event_id,
+            AUTHOR,
+            TAGGED,
+            RELAY,
+            expires_at,
+        )
+        .unwrap();
+        NwcInvoiceMonitor::enable(
+            &mut conn,
+            "install-id",
+            &event_id,
+            AUTHOR,
+            TAGGED,
+            RELAY,
+            expires_at,
+        )
+        .unwrap();
+
+        assert_eq!(
+            schema::nwc_invoice_monitors::table
+                .count()
+                .get_result::<i64>(&mut conn)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            NwcInvoiceMonitor::disable(&mut conn, "install-id", &event_id, AUTHOR, RELAY,).unwrap(),
+            0
+        );
+        assert_eq!(
+            NwcInvoiceMonitor::disable(&mut conn, "install-id", &event_id, TAGGED, RELAY,).unwrap(),
+            1
+        );
         clear_database(&db_pool);
     }
 }
