@@ -2,6 +2,8 @@ use crate::models::schema::nwc_invoice_monitors;
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 
+const MAX_SETTLEMENT_WAKE_COUNT: i32 = 12;
+
 #[allow(dead_code)]
 #[derive(Queryable, Debug, Clone)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -96,7 +98,7 @@ impl NwcInvoiceMonitor {
             let due = nwc_invoice_monitors::table
                 .filter(nwc_invoice_monitors::enabled.eq(true))
                 .filter(nwc_invoice_monitors::expires_at.gt(now))
-                .filter(nwc_invoice_monitors::wake_count.lt(24))
+                .filter(nwc_invoice_monitors::wake_count.lt(MAX_SETTLEMENT_WAKE_COUNT))
                 .filter(nwc_invoice_monitors::next_wake_at.le(now))
                 .order(nwc_invoice_monitors::next_wake_at.asc())
                 .limit(maximum)
@@ -105,15 +107,7 @@ impl NwcInvoiceMonitor {
                 .load::<Self>(conn)?;
             for monitor in &due {
                 let next_count = monitor.wake_count.saturating_add(1).min(64);
-                let delay_seconds = match next_count {
-                    0..=2 => 5,
-                    3 => 10,
-                    4 => 20,
-                    5 => 30,
-                    6 => 60,
-                    7 => 120,
-                    _ => 300,
-                };
+                let delay_seconds = next_wake_delay_seconds(next_count);
                 diesel::update(
                     nwc_invoice_monitors::table
                         .filter(nwc_invoice_monitors::id.eq(&monitor.id))
@@ -154,12 +148,35 @@ impl NwcInvoiceMonitor {
         Ok(diesel::update(
             nwc_invoice_monitors::table
                 .filter(nwc_invoice_monitors::enabled.eq(true))
-                .filter(nwc_invoice_monitors::wake_count.ge(24)),
+                .filter(nwc_invoice_monitors::wake_count.ge(MAX_SETTLEMENT_WAKE_COUNT)),
         )
         .set((
             nwc_invoice_monitors::enabled.eq(false),
             nwc_invoice_monitors::updated_at.eq(diesel::dsl::now),
         ))
         .execute(conn)?)
+    }
+}
+
+const fn next_wake_delay_seconds(next_count: i32) -> i64 {
+    match next_count {
+        0 | 1 => 30,
+        2 => 60,
+        3 => 120,
+        _ => 300,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settlement_checks_back_off_after_the_initial_wake() {
+        assert_eq!(next_wake_delay_seconds(1), 30);
+        assert_eq!(next_wake_delay_seconds(2), 60);
+        assert_eq!(next_wake_delay_seconds(3), 120);
+        assert_eq!(next_wake_delay_seconds(4), 300);
+        assert_eq!(next_wake_delay_seconds(12), 300);
     }
 }
