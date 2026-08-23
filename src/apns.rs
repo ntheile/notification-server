@@ -14,6 +14,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const APNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_APNS_PAYLOAD_BYTES: usize = 4096;
 
+#[derive(Clone, Copy)]
+enum WakeKind {
+    EventAlert,
+    SettlementBackground,
+    SettlementAlert,
+}
+
 #[derive(Debug)]
 pub struct ApnsSendReceipt {
     pub apns_id: Option<String>,
@@ -121,7 +128,7 @@ impl ApnsPushClient {
             &event.id.to_hex(),
             wallet_service_pubkey(event).as_deref(),
             Some(event_json),
-            false,
+            WakeKind::EventAlert,
         )
         .await
     }
@@ -139,12 +146,12 @@ impl ApnsPushClient {
             event_id,
             wallet_service_pubkey,
             None,
-            false,
+            WakeKind::EventAlert,
         )
         .await
     }
 
-    pub async fn send_settlement_check(
+    pub async fn send_settlement_background(
         &self,
         registration: &NwcPushRegistration,
         relay: &str,
@@ -157,7 +164,25 @@ impl ApnsPushClient {
             event_id,
             Some(wallet_service_pubkey),
             None,
-            true,
+            WakeKind::SettlementBackground,
+        )
+        .await
+    }
+
+    pub async fn send_settlement_alert(
+        &self,
+        registration: &NwcPushRegistration,
+        relay: &str,
+        event_id: &str,
+        wallet_service_pubkey: &str,
+    ) -> std::result::Result<ApnsSendReceipt, ApnsSendError> {
+        self.send_wake_inner(
+            registration,
+            relay,
+            event_id,
+            Some(wallet_service_pubkey),
+            None,
+            WakeKind::SettlementAlert,
         )
         .await
     }
@@ -169,7 +194,7 @@ impl ApnsPushClient {
         event_id: &str,
         wallet_service_pubkey: Option<&str>,
         nwc_event: Option<String>,
-        settlement_check: bool,
+        kind: WakeKind,
     ) -> std::result::Result<ApnsSendReceipt, ApnsSendError> {
         let wallet_service_pubkey = wallet_service_pubkey.unwrap_or(&registration.tagged);
         let token = registration
@@ -191,20 +216,14 @@ impl ApnsPushClient {
             event_id,
             wallet_service_pubkey,
             nwc_event.as_deref(),
-            settlement_check,
+            kind,
         );
         if nwc_event.is_some() && payload_size(&payload)? > MAX_APNS_PAYLOAD_BYTES {
             warn!(
                 "Omitting embedded NWC event from APNS wake payload for event {} because it exceeds {} bytes",
                 event_id, MAX_APNS_PAYLOAD_BYTES
             );
-            payload = wake_payload(
-                relay,
-                event_id,
-                wallet_service_pubkey,
-                None,
-                settlement_check,
-            );
+            payload = wake_payload(relay, event_id, wallet_service_pubkey, None, kind);
             embedded_event = false;
         }
         let size = payload_size(&payload)?;
@@ -225,8 +244,12 @@ impl ApnsPushClient {
             HeaderValue::from_str(&registration.app_id)
                 .map_err(|e| ApnsSendError::Build(format!("invalid APNS topic header: {e}")))?,
         );
-        headers.insert("apns-push-type", HeaderValue::from_static("alert"));
-        headers.insert("apns-priority", HeaderValue::from_static("10"));
+        let (push_type, priority) = match kind {
+            WakeKind::SettlementBackground => ("background", "5"),
+            WakeKind::EventAlert | WakeKind::SettlementAlert => ("alert", "10"),
+        };
+        headers.insert("apns-push-type", HeaderValue::from_static(push_type));
+        headers.insert("apns-priority", HeaderValue::from_static(priority));
         headers.insert(
             "apns-collapse-id",
             HeaderValue::from_str(event_id)
@@ -304,33 +327,54 @@ fn wake_payload(
     event_id: &str,
     wallet_service_pubkey: &str,
     nwc_event: Option<&str>,
-    settlement_check: bool,
+    kind: WakeKind,
 ) -> serde_json::Value {
-    let body = if settlement_check {
-        "Checking incoming payment"
-    } else {
-        "Received 1 Event"
-    };
-    let mut payload = json!({
-        "aps": {
-            "alert": {
-                "title": "Nostr Connect",
-                "body": body
+    let mut payload = match kind {
+        WakeKind::SettlementBackground => json!({
+            "aps": {
+                "content-available": 1
             },
-            "mutable-content": 1,
-            "content-available": 1
-        },
-        "protocol": "nwc_wake",
-        "version": "v1",
-        "relay": relay,
-        "event_id": event_id,
-        "wallet_service_pubkey": wallet_service_pubkey
-    });
+            "protocol": "nwc_wake",
+            "version": "v1",
+            "relay": relay,
+            "event_id": event_id,
+            "wallet_service_pubkey": wallet_service_pubkey,
+            "settlement_check": true
+        }),
+        WakeKind::SettlementAlert => json!({
+            "aps": {
+                "alert": {
+                    "title": "Incoming payment",
+                    "body": "Finalizing your NWC invoice"
+                },
+                "mutable-content": 1,
+                "content-available": 1
+            },
+            "protocol": "nwc_wake",
+            "version": "v1",
+            "relay": relay,
+            "event_id": event_id,
+            "wallet_service_pubkey": wallet_service_pubkey,
+            "settlement_check": true
+        }),
+        WakeKind::EventAlert => json!({
+            "aps": {
+                "alert": {
+                    "title": "Nostr Connect",
+                    "body": "Received 1 Event"
+                },
+                "mutable-content": 1,
+                "content-available": 1
+            },
+            "protocol": "nwc_wake",
+            "version": "v1",
+            "relay": relay,
+            "event_id": event_id,
+            "wallet_service_pubkey": wallet_service_pubkey
+        }),
+    };
     if let Some(nwc_event) = nwc_event {
         payload["nwc_event"] = json!(nwc_event);
-    }
-    if settlement_check {
-        payload["settlement_check"] = json!(true);
     }
     payload
 }
@@ -359,4 +403,38 @@ fn is_permanent_apns_failure(status: reqwest::StatusCode) -> bool {
             | reqwest::StatusCode::PAYLOAD_TOO_LARGE
             | reqwest::StatusCode::GONE
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{wake_payload, WakeKind};
+
+    #[test]
+    fn settlement_background_wake_has_no_user_visible_keys() {
+        let payload = wake_payload(
+            "wss://relay.example.com",
+            &"01".repeat(32),
+            &"02".repeat(32),
+            None,
+            WakeKind::SettlementBackground,
+        );
+        let aps = payload["aps"].as_object().expect("aps dictionary");
+        assert_eq!(aps.len(), 1);
+        assert_eq!(aps["content-available"], 1);
+        assert_eq!(payload["settlement_check"], true);
+    }
+
+    #[test]
+    fn settlement_fallback_is_one_mutable_alert() {
+        let payload = wake_payload(
+            "wss://relay.example.com",
+            &"01".repeat(32),
+            &"02".repeat(32),
+            None,
+            WakeKind::SettlementAlert,
+        );
+        assert_eq!(payload["aps"]["mutable-content"], 1);
+        assert_eq!(payload["aps"]["content-available"], 1);
+        assert_eq!(payload["aps"]["alert"]["title"], "Incoming payment");
+    }
 }

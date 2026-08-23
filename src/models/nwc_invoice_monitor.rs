@@ -17,6 +17,22 @@ pub struct NwcInvoiceMonitor {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub trigger_token_hash: Option<String>,
+    pub settlement_signaled_at: Option<DateTime<Utc>>,
+    pub silent_sent_at: Option<DateTime<Utc>>,
+    pub alert_sent_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SettlementDelivery {
+    Background,
+    AlertFallback,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimedSettlementDelivery {
+    pub monitor: NwcInvoiceMonitor,
+    pub delivery: SettlementDelivery,
 }
 
 #[derive(Insertable)]
@@ -29,6 +45,7 @@ struct NewNwcInvoiceMonitor<'a> {
     relay: &'a str,
     expires_at: DateTime<Utc>,
     next_wake_at: DateTime<Utc>,
+    trigger_token_hash: &'a str,
 }
 
 impl NwcInvoiceMonitor {
@@ -41,6 +58,7 @@ impl NwcInvoiceMonitor {
         wallet_service_pubkey: &str,
         relay: &str,
         expires_at: DateTime<Utc>,
+        trigger_token_hash: &str,
     ) -> anyhow::Result<()> {
         let new = NewNwcInvoiceMonitor {
             id,
@@ -49,7 +67,10 @@ impl NwcInvoiceMonitor {
             wallet_service_pubkey,
             relay,
             expires_at,
-            next_wake_at: Utc::now() + Duration::seconds(5),
+            // Registration alone never wakes the phone. The event source moves
+            // this deadline forward only after Bark reports mailbox activity.
+            next_wake_at: expires_at,
+            trigger_token_hash,
         };
         diesel::insert_into(nwc_invoice_monitors::table)
             .values(&new)
@@ -62,11 +83,34 @@ impl NwcInvoiceMonitor {
             .do_update()
             .set((
                 nwc_invoice_monitors::expires_at.eq(expires_at),
+                nwc_invoice_monitors::trigger_token_hash.eq(trigger_token_hash),
                 nwc_invoice_monitors::enabled.eq(true),
                 nwc_invoice_monitors::updated_at.eq(diesel::dsl::now),
             ))
             .execute(conn)?;
         Ok(())
+    }
+
+    pub fn signal_settlement(
+        conn: &mut PgConnection,
+        request_event_id: &str,
+        trigger_token_hash: &str,
+    ) -> anyhow::Result<usize> {
+        let now = Utc::now();
+        Ok(diesel::update(
+            nwc_invoice_monitors::table
+                .filter(nwc_invoice_monitors::request_event_id.eq(request_event_id))
+                .filter(nwc_invoice_monitors::trigger_token_hash.eq(trigger_token_hash))
+                .filter(nwc_invoice_monitors::enabled.eq(true))
+                .filter(nwc_invoice_monitors::expires_at.gt(now))
+                .filter(nwc_invoice_monitors::settlement_signaled_at.is_null()),
+        )
+        .set((
+            nwc_invoice_monitors::settlement_signaled_at.eq(now),
+            nwc_invoice_monitors::next_wake_at.eq(now),
+            nwc_invoice_monitors::updated_at.eq(diesel::dsl::now),
+        ))
+        .execute(conn)?)
     }
 
     pub fn disable(
@@ -90,13 +134,18 @@ impl NwcInvoiceMonitor {
         .execute(conn)?)
     }
 
-    pub fn claim_due(conn: &mut PgConnection, maximum: i64) -> anyhow::Result<Vec<Self>> {
+    pub fn claim_due(
+        conn: &mut PgConnection,
+        maximum: i64,
+    ) -> anyhow::Result<Vec<ClaimedSettlementDelivery>> {
         let now = Utc::now();
         conn.transaction(|conn| {
             let due = nwc_invoice_monitors::table
                 .filter(nwc_invoice_monitors::enabled.eq(true))
                 .filter(nwc_invoice_monitors::expires_at.gt(now))
-                .filter(nwc_invoice_monitors::wake_count.lt(24))
+                .filter(nwc_invoice_monitors::settlement_signaled_at.is_not_null())
+                .filter(nwc_invoice_monitors::alert_sent_at.is_null())
+                .filter(nwc_invoice_monitors::wake_count.lt(6))
                 .filter(nwc_invoice_monitors::next_wake_at.le(now))
                 .order(nwc_invoice_monitors::next_wake_at.asc())
                 .limit(maximum)
@@ -105,15 +154,6 @@ impl NwcInvoiceMonitor {
                 .load::<Self>(conn)?;
             for monitor in &due {
                 let next_count = monitor.wake_count.saturating_add(1).min(64);
-                let delay_seconds = match next_count {
-                    0..=2 => 5,
-                    3 => 10,
-                    4 => 20,
-                    5 => 30,
-                    6 => 60,
-                    7 => 120,
-                    _ => 300,
-                };
                 diesel::update(
                     nwc_invoice_monitors::table
                         .filter(nwc_invoice_monitors::id.eq(&monitor.id))
@@ -128,13 +168,83 @@ impl NwcInvoiceMonitor {
                 )
                 .set((
                     nwc_invoice_monitors::wake_count.eq(next_count),
-                    nwc_invoice_monitors::next_wake_at.eq(now + Duration::seconds(delay_seconds)),
+                    // This is a delivery lease, not another user-visible wake.
+                    // A crashed worker retries the same stage after it expires.
+                    nwc_invoice_monitors::next_wake_at.eq(now + Duration::seconds(30)),
                     nwc_invoice_monitors::updated_at.eq(diesel::dsl::now),
                 ))
                 .execute(conn)?;
             }
-            Ok(due)
+            Ok(due
+                .into_iter()
+                .map(|monitor| ClaimedSettlementDelivery {
+                    delivery: if monitor.silent_sent_at.is_none() {
+                        SettlementDelivery::Background
+                    } else {
+                        SettlementDelivery::AlertFallback
+                    },
+                    monitor,
+                })
+                .collect())
         })
+    }
+
+    pub fn mark_delivered(
+        conn: &mut PgConnection,
+        monitor: &Self,
+        delivery: SettlementDelivery,
+    ) -> anyhow::Result<usize> {
+        let now = Utc::now();
+        let target = nwc_invoice_monitors::table
+            .filter(nwc_invoice_monitors::id.eq(&monitor.id))
+            .filter(nwc_invoice_monitors::request_event_id.eq(&monitor.request_event_id))
+            .filter(nwc_invoice_monitors::wallet_service_pubkey.eq(&monitor.wallet_service_pubkey))
+            .filter(nwc_invoice_monitors::relay.eq(&monitor.relay))
+            .filter(nwc_invoice_monitors::enabled.eq(true));
+        match delivery {
+            SettlementDelivery::Background => Ok(diesel::update(target)
+                .set((
+                    nwc_invoice_monitors::silent_sent_at.eq(now),
+                    // Give the invisible app wake time to publish and acknowledge
+                    // before falling back to the killed-app NSE path.
+                    nwc_invoice_monitors::next_wake_at.eq(now + Duration::seconds(10)),
+                    nwc_invoice_monitors::updated_at.eq(diesel::dsl::now),
+                ))
+                .execute(conn)?),
+            SettlementDelivery::AlertFallback => Ok(diesel::update(target)
+                .set((
+                    nwc_invoice_monitors::alert_sent_at.eq(now),
+                    nwc_invoice_monitors::next_wake_at.eq(monitor.expires_at),
+                    nwc_invoice_monitors::updated_at.eq(diesel::dsl::now),
+                ))
+                .execute(conn)?),
+        }
+    }
+
+    pub fn retry_delivery(
+        conn: &mut PgConnection,
+        monitor: &Self,
+        delivery: SettlementDelivery,
+    ) -> anyhow::Result<usize> {
+        let delay = match delivery {
+            SettlementDelivery::Background => 5,
+            SettlementDelivery::AlertFallback => 30,
+        };
+        Ok(diesel::update(
+            nwc_invoice_monitors::table
+                .filter(nwc_invoice_monitors::id.eq(&monitor.id))
+                .filter(nwc_invoice_monitors::request_event_id.eq(&monitor.request_event_id))
+                .filter(
+                    nwc_invoice_monitors::wallet_service_pubkey.eq(&monitor.wallet_service_pubkey),
+                )
+                .filter(nwc_invoice_monitors::relay.eq(&monitor.relay))
+                .filter(nwc_invoice_monitors::enabled.eq(true)),
+        )
+        .set((
+            nwc_invoice_monitors::next_wake_at.eq(Utc::now() + Duration::seconds(delay)),
+            nwc_invoice_monitors::updated_at.eq(diesel::dsl::now),
+        ))
+        .execute(conn)?)
     }
 
     pub fn disable_expired(conn: &mut PgConnection) -> anyhow::Result<usize> {
@@ -154,7 +264,7 @@ impl NwcInvoiceMonitor {
         Ok(diesel::update(
             nwc_invoice_monitors::table
                 .filter(nwc_invoice_monitors::enabled.eq(true))
-                .filter(nwc_invoice_monitors::wake_count.ge(24)),
+                .filter(nwc_invoice_monitors::wake_count.ge(6)),
         )
         .set((
             nwc_invoice_monitors::enabled.eq(false),
