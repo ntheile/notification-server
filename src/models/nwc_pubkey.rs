@@ -86,3 +86,23 @@ impl NwcPubkeys {
         })
     }
 }
+
+impl NwcFilterInfo {
+    pub fn merge(&mut self, other: Self) {
+        for author in other.authors {
+            if !self.authors.contains(&author) {
+                self.authors.push(author);
+            }
+        }
+        for tagged in other.tagged {
+            if !self.tagged.contains(&tagged) {
+                self.tagged.push(tagged);
+            }
+        }
+        for relay in other.relays {
+            if !self.relays.contains(&relay) {
+                self.relays.push(relay);
+            }
+        }
+    }
+}

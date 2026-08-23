@@ -1,11 +1,18 @@
+mod apns;
 mod auth;
+mod fcm;
 mod listener;
 mod models;
+mod nwc;
 mod routes;
+mod settlement_monitor;
 
+use crate::apns::ApnsPushClient;
 use crate::models::nwc_pubkey::{NwcFilterInfo, NwcPubkeys};
+use crate::models::nwc_push_registration::NwcPushRegistration;
 use crate::models::MIGRATIONS;
-use crate::routes::{broadcast, health_check, register, register_nwc, valid_origin, validate_cors};
+use crate::nwc::{monitor_nwc_invoice, register_nwc, register_nwc_push};
+use crate::routes::{broadcast, health_check, register, valid_origin, validate_cors};
 use axum::headers::Origin;
 use axum::http::{header, request::Parts, HeaderValue, StatusCode, Uri};
 use axum::routing::{get, post};
@@ -14,7 +21,7 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::PgConnection;
 use diesel_migrations::MigrationHarness;
 use secp256k1::{All, PublicKey, Secp256k1};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{watch, Mutex};
 use tower_http::cors::{AllowMethods, AllowOrigin, CorsLayer};
 use web_push::{IsahcWebPushClient, PartialVapidSignatureBuilder, VapidSignatureBuilder};
@@ -31,13 +38,24 @@ const ALLOWED_ORIGINS: [&str; 6] = [
 const ALLOWED_SUBDOMAIN: &str = ".mutiny-web.pages.dev";
 const ALLOWED_LOCALHOST: &str = "http://127.0.0.1:";
 
+pub(crate) fn debug_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LOG")
+            .ok()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("debug"))
+    })
+}
+
 #[derive(Clone)]
 pub struct State {
     pub db_pool: Pool<ConnectionManager<PgConnection>>,
     pub sig_builder: PartialVapidSignatureBuilder,
     pub auth_key: Option<PublicKey>,
     pub self_hosted: bool,
+    pub public_base_url: Option<String>,
     pub client: IsahcWebPushClient,
+    pub apns_client: Option<ApnsPushClient>,
     pub channel: Arc<Mutex<watch::Sender<NwcFilterInfo>>>,
     pub secp: Secp256k1<All>,
 }
@@ -72,6 +90,18 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| p.parse::<u16>())
         .transpose()?
         .unwrap_or(8080);
+    let public_base_url = std::env::var("PUBLIC_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.starts_with("http://") || value.starts_with("https://") {
+                Ok(value)
+            } else {
+                anyhow::bail!("PUBLIC_BASE_URL must start with http:// or https://")
+            }
+        })
+        .transpose()?;
 
     // DB management
     let manager = ConnectionManager::<PgConnection>::new(&pg_url);
@@ -86,13 +116,21 @@ async fn main() -> anyhow::Result<()> {
         .run_pending_migrations(MIGRATIONS)
         .expect("migrations could not run");
 
-    let filter_info = NwcPubkeys::get_filter_info(&mut connection)?;
+    let mut filter_info = NwcPubkeys::get_filter_info(&mut connection)?;
+    filter_info.merge(NwcPushRegistration::get_filter_info(&mut connection)?);
+    println!(
+        "Initial NWC watcher filter: authors={} wallet_pubkeys={} relays={}",
+        filter_info.authors.len(),
+        filter_info.tagged.len(),
+        filter_info.relays.len()
+    );
     let (sender, receiver) = watch::channel(filter_info);
     let channel = Arc::new(Mutex::new(sender));
 
     drop(connection);
 
     let client = IsahcWebPushClient::new()?;
+    let apns_client = ApnsPushClient::from_env()?;
     let secp = Secp256k1::gen_new();
 
     let state = State {
@@ -100,7 +138,9 @@ async fn main() -> anyhow::Result<()> {
         sig_builder: sig_builder.clone(),
         auth_key,
         self_hosted,
+        public_base_url,
         client: client.clone(),
+        apns_client: apns_client.clone(),
         channel,
         secp,
     };
@@ -127,6 +167,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/health-check", get(health_check))
         .route("/register", post(register))
         .route("/register-nwc", post(register_nwc))
+        .route("/register-nwc-push", post(register_nwc_push))
+        .route("/monitor-nwc-invoice", post(monitor_nwc_invoice))
         .route("/broadcast", post(broadcast))
         .fallback(fallback)
         .layer(
@@ -142,6 +184,15 @@ async fn main() -> anyhow::Result<()> {
     println!("Webserver running on http://{addr}");
 
     // start the listener
+    if let Some(monitor_apns) = apns_client.clone() {
+        let monitor_pool = db_pool.clone();
+        tokio::spawn(async move {
+            if let Err(error) = settlement_monitor::run(monitor_pool, monitor_apns).await {
+                eprintln!("settlement monitor error: {error}");
+            }
+        });
+    }
+
     tokio::spawn(async move {
         loop {
             if let Err(e) = listener::start_listener(
@@ -149,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
                 receiver.clone(),
                 sig_builder.clone(),
                 client.clone(),
+                apns_client.clone(),
             )
             .await
             {
